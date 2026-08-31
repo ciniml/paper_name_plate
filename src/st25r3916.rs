@@ -96,7 +96,9 @@ pub mod irq {
     pub const PAR: u32 = 0x40 << 8;
     pub const ERR2: u32 = 0x20 << 8;
     pub const ERR1: u32 = 0x10 << 8;
-    pub const ERROR_MASK: u32 = 0x0000_FF00;
+    /// Communication errors only (CRC, parity, framing); the low nibble of
+    /// the error register holds wake-up flags, which are not errors.
+    pub const ERROR_MASK: u32 = 0x0000_F000;
 }
 
 mod op {
@@ -145,6 +147,12 @@ impl NfcaTag {
     /// SAK bit 6 set → ISO14443-4 compliant (e.g. DESFire, smartphones).
     pub fn is_iso14443_4(&self) -> bool {
         self.sak & 0x20 != 0
+    }
+    /// Random (per-activation) UID, as used by smartphones: 4-byte UID
+    /// starting with 0x08. Such UIDs change on every activation, so identity
+    /// comparisons across polls are meaningless.
+    pub fn has_random_uid(&self) -> bool {
+        self.uid_len == 4 && self.uid[0] == 0x08
     }
 }
 

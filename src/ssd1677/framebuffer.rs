@@ -89,6 +89,39 @@ impl FrameBuffer {
     pub fn mono_plane(&self) -> &[u8; PLANE_BYTES] {
         &self.msb
     }
+
+    /// Copy the full image from `src` (used to track what is on glass).
+    pub fn copy_from(&mut self, src: &FrameBuffer) {
+        self.lsb.copy_from_slice(&src.lsb);
+        self.msb.copy_from_slice(&src.msb);
+    }
+
+    /// Fold a monochrome update into this buffer: for the given *native*
+    /// region (rows = logical x, byte-aligned bit columns = logical y), set
+    /// both planes to `mono` so the buffer matches the glass after a
+    /// `refresh_fastest`.
+    pub fn apply_mono_region(&mut self, mono: &[u8; PLANE_BYTES], x0: u16, w: u16, y0: u16, h: u16) {
+        let first = (x0 & !7) as usize / 8;
+        let last = (((x0 + w - 1) | 7).min(HEIGHT as u16 - 1)) as usize / 8;
+        let ys = y0 as usize;
+        let ye = (y0 + h - 1).min(WIDTH as u16 - 1) as usize;
+        for y in ys..=ye {
+            let o = y * ROW_BYTES;
+            self.lsb[o + first..=o + last].copy_from_slice(&mono[o + first..=o + last]);
+            self.msb[o + first..=o + last].copy_from_slice(&mono[o + first..=o + last]);
+        }
+    }
+
+    /// Map a logical rectangle (portrait coords) to the native region used by
+    /// `refresh_fastest` / `apply_mono_region`: returns (x0_bits, w_bits,
+    /// y0_rows, h_rows). Assumes no orientation flips.
+    pub fn native_region(x: u32, y: u32, w: u32, h: u32) -> (u16, u16, u16, u16) {
+        let x = x.min(WIDTH - 1);
+        let y = y.min(HEIGHT - 1);
+        let w = w.min(WIDTH - x);
+        let h = h.min(HEIGHT - y);
+        (y as u16, h as u16, x as u16, w as u16)
+    }
 }
 
 impl Default for FrameBuffer {

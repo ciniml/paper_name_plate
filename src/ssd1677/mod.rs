@@ -416,6 +416,81 @@ where
         }
     }
 
+    /// Differential monochrome update (Mode 2, `LUT_FASTEST`, ~70 ms).
+    ///
+    /// * `new_msb`  — the new monochrome image (framebuffer MSB plane, 1 = white)
+    /// * `old_lsb` / `old_msb` — the planes currently on glass (from the last
+    ///   absolute refresh, with mono updates folded in by the caller)
+    /// * `x0/w` (RAM X bits = logical y) and `y0/h` (RAM Y rows = logical x)
+    ///   bound the region that may have changed; it is byte-aligned internally.
+    ///
+    /// Pixels outside the region (and unchanged pixels inside) receive a
+    /// hold waveform, so surrounding gray areas are preserved. The caller must
+    /// afterwards mirror `new_msb` into both `old_*` planes for the region
+    /// (see [`FrameBuffer`]) and should do a periodic absolute refresh to
+    /// clear accumulated ghosting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refresh_fastest(
+        &mut self,
+        delay: &mut impl DelayNs,
+        new_msb: &[u8; PLANE_BYTES],
+        old_lsb: &[u8; PLANE_BYTES],
+        old_msb: &[u8; PLANE_BYTES],
+        x0: u16,
+        w: u16,
+        y0: u16,
+        h: u16,
+    ) -> Res<(), SPI, DC> {
+        self.ensure_known_face(delay)?;
+
+        let first = (x0 & !7) as usize / 8;
+        let last = (((x0 + w - 1) | 7).min(RAM_X_PIXELS - 1)) as usize / 8;
+        let ys = y0 as usize;
+        let ye = (y0 + h - 1).min(RAM_Y_LINES - 1) as usize;
+
+        // BW RAM: old image with the dirty window replaced by the new image.
+        self.set_full_window()?;
+        self.command(cmd::WRITE_RAM_BW)?;
+        self.select()?;
+        self.dc.set_high().map_err(Error::Pin)?;
+        for y in 0..RAM_Y_LINES as usize {
+            let o = y * ROW_BYTES;
+            self.row.copy_from_slice(&old_msb[o..o + ROW_BYTES]);
+            if y >= ys && y <= ye {
+                self.row[first..=last].copy_from_slice(&new_msb[o + first..=o + last]);
+            }
+            self.spi.write(&self.row).map_err(Error::Spi)?;
+        }
+        self.spi.flush().map_err(Error::Spi)?;
+        self.deselect()?;
+
+        // RED RAM: transition class. Outside the window: old image (hold).
+        // Inside: new ? (old_lsb & old_msb) : (old_lsb | old_msb), so an old
+        // middle gray is driven all the way to the requested endpoint.
+        self.set_full_window()?;
+        self.command(cmd::WRITE_RAM_RED)?;
+        self.select()?;
+        self.dc.set_high().map_err(Error::Pin)?;
+        for y in 0..RAM_Y_LINES as usize {
+            let o = y * ROW_BYTES;
+            self.row.copy_from_slice(&old_msb[o..o + ROW_BYTES]);
+            if y >= ys && y <= ye {
+                for b in first..=last {
+                    let n = new_msb[o + b];
+                    let l = old_lsb[o + b];
+                    let m = old_msb[o + b];
+                    self.row[b] = (n & (l & m)) | (!n & (l | m));
+                }
+            }
+            self.spi.write(&self.row).map_err(Error::Spi)?;
+        }
+        self.spi.flush().map_err(Error::Spi)?;
+        self.deselect()?;
+
+        self.send_lut(&lut::LUT_FASTEST)?;
+        self.activate(delay, 0x00, ctrl2::MODE2 | ctrl2::DISPLAY, 5_000)
+    }
+
     /// Convenience: full 4-gray refresh straight from a framebuffer.
     pub fn display_gray4(&mut self, delay: &mut impl DelayNs, fb: &FrameBuffer, mode: GrayMode) -> Res<(), SPI, DC> {
         self.refresh_gray4(delay, &fb.lsb, &fb.msb, mode)

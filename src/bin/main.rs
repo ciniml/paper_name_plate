@@ -40,6 +40,19 @@ use alloc::string::String;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static FRAMEBUFFER: StaticCell<FrameBuffer> = StaticCell::new();
+/// Copy of what is currently on the panel (baseline for differential updates).
+static DISPLAYED: StaticCell<FrameBuffer> = StaticCell::new();
+
+/// Tag panel area in logical coordinates (must match `draw_tag_panel`).
+const PANEL_X: u32 = 12;
+const PANEL_Y: u32 = 200;
+const PANEL_W: u32 = WIDTH - 24;
+const PANEL_H: u32 = 380;
+
+/// EPD is put into deep sleep after this much time without a tag.
+const EPD_IDLE_SLEEP_MS: u64 = 60_000;
+/// A full (Text-mode) refresh is forced after this many fastest updates.
+const FASTEST_PER_FULL: u32 = 10;
 
 #[allow(clippy::large_stack_frames, reason = "main owns the peripherals")]
 #[main]
@@ -147,11 +160,13 @@ fn main() -> ! {
     // Initial screen
     // ---------------------------------------------------------------
     let fb = FRAMEBUFFER.init(FrameBuffer::new());
+    let displayed = DISPLAYED.init(FrameBuffer::new());
     draw_base_screen(fb, nfc_ok);
     match epd.display_gray4(&mut delay, fb, GrayMode::Quality) {
         Ok(()) => info!("EPD initial refresh done"),
         Err(e) => error!("EPD refresh failed: {e:?}"),
     }
+    displayed.copy_from(fb);
 
     // Front light: brief blink so we know the PM1 PWM path works, then off.
     if let Err(e) = pm1.init_frontlight(5000) {
@@ -169,13 +184,21 @@ fn main() -> ! {
     let mut fast_refreshes: u32 = 0;
     let mut last_seen = Instant::now();
     let mut polls: u32 = 0;
+    let mut epd_sleeping = false;
 
     loop {
-        delay.delay_millis(200);
+        delay.delay_millis(if epd_sleeping { 500 } else { 200 });
         if !nfc_ok {
             continue;
         }
         polls += 1;
+        if !epd_sleeping && last_seen.elapsed().as_millis() > EPD_IDLE_SLEEP_MS {
+            info!("EPD: idle -> deep sleep");
+            if let Err(e) = epd.deep_sleep(&mut delay) {
+                error!("EPD deep sleep failed: {e:?}");
+            }
+            epd_sleeping = true;
+        }
         if polls.is_multiple_of(300) {
             let (opc, aux, _) = nfc.status().unwrap_or((0, 0, 0));
             info!("NFC heartbeat: polls={polls} tags={tag_count} op_ctrl=0x{opc:02X} aux=0x{aux:02X}");
@@ -183,9 +206,24 @@ fn main() -> ! {
         match nfc.nfca_poll(&mut delay) {
             Ok(Some(tag)) => {
                 last_seen = Instant::now();
-                if last_tag.as_ref().is_some_and(|t| t.uid() == tag.uid()) {
+                let same = last_tag.as_ref().is_some_and(|t| {
+                    // Random UIDs (smartphones) change on every activation:
+                    // treat a continuously-present random-UID tag as the same.
+                    t.uid() == tag.uid() || (t.has_random_uid() && tag.has_random_uid())
+                });
+                if same {
                     let _ = nfc.nfca_halt(&mut delay);
                     continue; // same tag still present
+                }
+                if epd_sleeping {
+                    // Wake the panel: hardware reset + re-init; RAM history is gone.
+                    info!("EPD: waking from deep sleep");
+                    let _ = board::epd_hard_reset(&mut ioe, &mut delay);
+                    if let Err(e) = epd.init(&mut delay) {
+                        error!("EPD re-init failed: {e:?}");
+                    }
+                    epd_sleeping = false;
+                    fast_refreshes = 0;
                 }
                 tag_count += 1;
                 info!(
@@ -212,11 +250,25 @@ fn main() -> ! {
                 };
                 let _ = nfc.nfca_halt(&mut delay);
                 draw_tag_panel(fb, &tag, tag_count, t2.as_ref());
-                let mode = if fast_refreshes.is_multiple_of(8) { GrayMode::Text } else { GrayMode::Fast };
-                fast_refreshes += 1;
-                if let Err(e) = epd.display_gray4(&mut delay, fb, mode) {
-                    error!("EPD refresh failed: {e:?}");
+                if fast_refreshes.is_multiple_of(FASTEST_PER_FULL) {
+                    // Periodic absolute refresh clears ghosting and rebuilds
+                    // the 4-gray baseline.
+                    match epd.display_gray4(&mut delay, fb, GrayMode::Text) {
+                        Ok(()) => displayed.copy_from(fb),
+                        Err(e) => error!("EPD text refresh failed: {e:?}"),
+                    }
+                } else {
+                    let (x0, w, y0, h) = FrameBuffer::native_region(PANEL_X, PANEL_Y, PANEL_W, PANEL_H);
+                    let t0 = Instant::now();
+                    match epd.refresh_fastest(&mut delay, &fb.msb, &displayed.lsb, &displayed.msb, x0, w, y0, h) {
+                        Ok(()) => {
+                            displayed.apply_mono_region(&fb.msb, x0, w, y0, h);
+                            info!("EPD fastest refresh: {} ms", t0.elapsed().as_millis());
+                        }
+                        Err(e) => error!("EPD fastest refresh failed: {e:?}"),
+                    }
                 }
+                fast_refreshes += 1;
                 last_tag = Some(tag);
             }
             Ok(None) => {
@@ -226,11 +278,18 @@ fn main() -> ! {
                 }
             }
             Err(e) => {
-                warn!("NFC poll error: {e:?}");
-                // Try to recover the field.
-                let _ = nfc.field_off();
-                delay.delay_millis(20);
-                let _ = nfc.configure_nfca(&mut delay);
+                // Transient CRC/parity/timeout errors are normal while a tag
+                // enters or leaves the field; only rebuild the RF path after
+                // an I2C-level failure.
+                match e {
+                    paper_name_plate::st25r3916::Error::I2c(_) => {
+                        warn!("NFC poll I2C error: {e:?}; reconfiguring");
+                        let _ = nfc.field_off();
+                        delay.delay_millis(20);
+                        let _ = nfc.configure_nfca(&mut delay);
+                    }
+                    _ => log::debug!("NFC poll: {e:?}"),
+                }
             }
         }
     }
