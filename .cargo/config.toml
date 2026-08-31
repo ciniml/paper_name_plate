@@ -1,0 +1,18 @@
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor --chip esp32s3"
+
+# Serial port of the PaperMono on this machine (override with ESPFLASH_PORT).
+
+[env]
+ESP_LOG="info"
+ESPFLASH_PORT="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_B8:1F:3F:D1:BE:60-if00"
+
+[build]
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+]
+
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["alloc", "core"]
