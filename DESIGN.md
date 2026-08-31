@@ -104,7 +104,7 @@ src/
 3. **ePaper (モノクロ)** — SSD1677 初期化、全画面白/黒、embedded-graphics で文字描画 → OTP フル更新。
 4. **ePaper (4 階調 / 部分更新)** — 済 (2026-09-01): 4 階調フル更新 (quality/text/fast) + fastest 差分更新（実測 95 ms/回、表示済みバッファをアプリで保持）。10 回ごとに Text 全面リフレッシュ。アイドル 60 秒で deep sleep、IOE1 リセットで復帰。
 5. **フロントライト** — 済: PM1 PWM0 で点灯確認。
-6. **NFC (ST25R3916, I2C)** — ~~レジスタアクセス → ISO14443A アンチコリジョン（UID 読み出し）~~ 済 → 必要なら NDEF / ISO-DEP (APDU) 読み出し。
+6. **NFC (ST25R3916, I2C)** — 済: UID 読み出し + ISO-DEP (RATS/APDU/WTX) + NDEF Type 4 読み出し実装（実データ検証は NDEF 公開デバイス待ち）。
 7. **タッチ (FT6336G)** — 済 (2026-09-01): `src/ft6336.rs`、リセット後 300 ms 待ちが必須。ポーリング方式。
 8. **省電力** — EPD deep sleep、PM1 シャットダウン / タイマー起床、ESP32-S3 deep sleep。
 

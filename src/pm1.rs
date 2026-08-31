@@ -173,8 +173,18 @@ impl<I2C: I2c> Pm1<I2C> {
     }
 
     /// Battery voltage in millivolts (12-bit value).
+    ///
+    /// Right after PM1 wake-up the ADC sometimes returns a bogus low value
+    /// (tens of mV observed); retry a few times until it looks plausible.
     pub fn battery_mv(&mut self) -> Result<u16, I2C::Error> {
-        Ok(reg::read_u16_le(&mut self.i2c, self.addr, regs::VBAT_L)? & 0x0FFF)
+        let mut v = 0;
+        for _ in 0..5 {
+            v = reg::read_u16_le(&mut self.i2c, self.addr, regs::VBAT_L)? & 0x0FFF;
+            if v >= 1000 {
+                break;
+            }
+        }
+        Ok(v)
     }
 
     /// VIN (USB) voltage in millivolts.

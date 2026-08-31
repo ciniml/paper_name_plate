@@ -10,6 +10,8 @@ use static_cell::StaticCell;
 
 use crate::board::{self, Board};
 use crate::ft6336::TouchPoint;
+use crate::isodep::IsoDep;
+use crate::ndef;
 use crate::ssd1677::{FrameBuffer, GrayMode};
 use crate::st25r3916::{Error as NfcError, NfcaTag};
 
@@ -186,24 +188,56 @@ impl App {
             tag.sak,
             if tag.is_iso14443_4() { " (ISO14443-4)" } else { "" }
         );
-        // Type 2 read for NTAG/Ultralight-class tags.
-        let t2 = if !tag.is_iso14443_4() && tag.sak == 0x00 {
-            match nfc.t2t_read(&mut b.delay, 0) {
-                Ok(d) => {
-                    info!("  T2T blocks 0-3: {}", ui::hex(&d));
-                    Some(d)
+        // Content: NDEF over ISO-DEP for phones/Type 4, raw blocks for Type 2.
+        let mut t2 = None;
+        let mut detail: Option<alloc::string::String> = None;
+        if tag.is_iso14443_4() {
+            match IsoDep::activate(nfc, &mut b.delay) {
+                Ok(mut dep) => {
+                    info!("  ATS: {} (FWT {} ms, FSC {})", ui::hex(&dep.ats().raw), dep.ats().fwt_ms, dep.ats().fsc);
+                    match ndef::read_type4(&mut dep, nfc, &mut b.delay) {
+                        Ok(msg) => {
+                            let summary = ndef::summarize(&msg);
+                            info!("  NDEF ({} B): {summary}", msg.len());
+                            detail = Some(summary);
+                        }
+                        Err(e) => {
+                            info!("  NDEF read: {e:?}");
+                            detail = Some(match e {
+                                ndef::Error::Status { step, sw } => {
+                                    let mut s = alloc::string::String::new();
+                                    use core::fmt::Write as _;
+                                    let _ = write!(s, "no NDEF ({step}: SW={sw:04X})");
+                                    s
+                                }
+                                _ => alloc::string::String::from("no NDEF (protocol error)"),
+                            });
+                        }
+                    }
+                    let _ = dep.deselect(nfc, &mut b.delay);
                 }
                 Err(e) => {
-                    warn!("  T2T read failed: {e:?}");
-                    None
+                    warn!("  RATS failed: {e:?}");
+                    let _ = nfc.nfca_halt(&mut b.delay);
                 }
             }
         } else {
-            None
-        };
-        let _ = nfc.nfca_halt(&mut b.delay);
+            if tag.sak == 0x00 {
+                match nfc.t2t_read(&mut b.delay, 0) {
+                    Ok(d) => {
+                        info!("  T2T blocks 0-3: {}", ui::hex(&d));
+                        t2 = Some(d);
+                    }
+                    Err(e) => warn!("  T2T read failed: {e:?}"),
+                }
+            }
+            let _ = nfc.nfca_halt(&mut b.delay);
+        }
 
         ui::draw_tag_panel(self.fb, &tag, self.tag_count, t2.as_ref());
+        if let Some(d) = detail.as_deref() {
+            ui::draw_tag_detail(self.fb, d);
+        }
         self.refresh_panel_region();
         self.last_tag = Some(tag);
     }

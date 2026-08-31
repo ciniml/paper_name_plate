@@ -68,6 +68,20 @@ pub fn draw_base_screen(fb: &mut FrameBuffer, nfc_ok: bool) {
         .draw(fb);
 }
 
+/// Extra detail line (NDEF summary / status) inside the tag panel.
+pub fn draw_tag_detail(fb: &mut FrameBuffer, text: &str) {
+    let small = MonoTextStyle::new(&FONT_9X15, Gray2::BLACK);
+    // Wrap at ~48 chars per line, up to 5 lines.
+    let mut y = 364;
+    let bytes = text.as_bytes();
+    for chunk in bytes.chunks(48).take(5) {
+        if let Ok(sl) = core::str::from_utf8(chunk) {
+            let _ = Text::new(sl, Point::new(24, y), small).draw(fb);
+        }
+        y += 22;
+    }
+}
+
 /// Middle panel showing the last tag.
 pub fn draw_tag_panel(fb: &mut FrameBuffer, tag: &NfcaTag, count: u32, t2: Option<&[u8; 16]>) {
     let area = Rectangle::new(Point::new(PANEL_X as i32, PANEL_Y as i32), Size::new(PANEL_W, PANEL_H));
@@ -102,6 +116,7 @@ pub fn draw_tag_panel(fb: &mut FrameBuffer, tag: &NfcaTag, count: u32, t2: Optio
     let _ = write!(line, "Type: {kind}");
     let _ = Text::new(&line, Point::new(24, 324), small).draw(fb);
 
+    let _ = line; // reused below by draw_tag_detail callers
     if let Some(d) = t2 {
         let _ = Text::new("Blocks 0-3:", Point::new(24, 364), small).draw(fb);
         for (i, chunk) in d.chunks(4).enumerate() {
