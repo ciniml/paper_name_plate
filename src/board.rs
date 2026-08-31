@@ -1,11 +1,30 @@
-//! PaperMono board definition: pin map and bring-up helpers.
+//! PaperMono board definition: pin map, bring-up sequence and the [`Board`]
+//! struct that owns all peripheral drivers.
 //!
-//! Everything esp-hal specific lives here so the drivers stay portable.
+//! Everything esp-hal specific lives here (and in `bin/main.rs`) so the
+//! drivers stay portable.
+
+use core::cell::RefCell;
 
 use embedded_hal::delay::DelayNs;
 use embedded_hal::i2c::I2c;
+use embedded_hal_bus::i2c::RefCellDevice;
+use esp_hal::delay::Delay;
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::i2c::master::{Config as I2cConfig, I2c as EspI2c};
+use esp_hal::peripherals::Peripherals;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::spi::Mode as SpiMode;
+use esp_hal::time::Rate;
+use esp_hal::Blocking;
+use log::{error, info, warn};
+use static_cell::StaticCell;
 
+use crate::ft6336::Ft6336;
 use crate::ioe1::{Ioe1, Pin as IoePin};
+use crate::pm1::Pm1;
+use crate::ssd1677::Ssd1677;
+use crate::st25r3916::St25r3916;
 
 /// M5IOE1 pins (0-based; documentation label `PYGn` == index n-1).
 pub mod ioe {
@@ -61,6 +80,156 @@ pub mod i2c_addr {
     pub const PM1: u8 = 0x6E;
     /// Charger; must not stay on the bus for long (docs).
     pub const CHARGER_IP2315: u8 = 0x75;
+}
+
+
+/// The shared internal I2C bus.
+pub type Bus = RefCell<EspI2c<'static, Blocking>>;
+/// A device handle on the shared bus.
+pub type BusDevice = RefCellDevice<'static, EspI2c<'static, Blocking>>;
+/// The e-paper driver with its concrete transport types.
+pub type Epd = Ssd1677<Spi<'static, Blocking>, Output<'static>, Output<'static>, Input<'static>>;
+
+static I2C_BUS: StaticCell<Bus> = StaticCell::new();
+
+/// All PaperMono peripherals, brought up and ready to use.
+pub struct Board {
+    pub delay: Delay,
+    pub pm1: Pm1<BusDevice>,
+    pub ioe: Ioe1<BusDevice>,
+    pub epd: Epd,
+    /// `None` when the touch controller did not respond.
+    pub touch: Option<Ft6336<BusDevice>>,
+    /// `None` on the Lite model (no ST25R3916) or when init failed.
+    pub nfc: Option<St25r3916<BusDevice>>,
+    /// Touch INT (GPIO4, low while touched in polling mode).
+    pub tp_int: Input<'static>,
+    pub button_a: Input<'static>,
+    pub button_b: Input<'static>,
+}
+
+impl Board {
+    /// Bring the whole board up. Order matters:
+    /// PM1 (rails, I2C sleep off) -> IOE1 -> EPD/TP power + reset -> SPI/EPD ->
+    /// touch -> NFC. Failures of optional parts are logged, not fatal.
+    pub fn init(p: Peripherals) -> Self {
+        let mut delay = Delay::new();
+
+        // I2C @ 100 kHz. PM1/IOE1 default to 100 kHz and remember their SPD
+        // (400 kHz) bit across ESP32 resets (the PMIC is always powered);
+        // recover_i2c_speed() puts stray 400 kHz-mode devices back.
+        let i2c = EspI2c::new(p.I2C0, I2cConfig::default().with_frequency(Rate::from_khz(100)))
+            .expect("i2c config")
+            .with_sda(p.GPIO47)
+            .with_scl(p.GPIO48);
+        let bus: &'static Bus = I2C_BUS.init(RefCell::new(i2c));
+
+        // ---- PMIC ----
+        let mut pm1 = Pm1::new(RefCellDevice::new(bus));
+        if pm1.init(&mut delay).is_err() {
+            warn!("PM1 init failed at 100 kHz; resetting PM1/IOE1 I2C speed");
+            recover_i2c_speed(bus, &mut delay);
+        }
+        match pm1.init(&mut delay) {
+            Ok(()) => {
+                let hw = pm1.hw_rev().unwrap_or(0);
+                let sw = pm1.sw_rev().unwrap_or(0);
+                let src = pm1.power_source().unwrap_or(0xFF);
+                let vbat = pm1.battery_mv().unwrap_or(0);
+                let vin = pm1.vin_mv().unwrap_or(0);
+                info!("PM1 ok: hw={hw} sw={sw} src={src} vbat={vbat}mV vin={vin}mV");
+            }
+            Err(e) => error!("PM1 init failed: {e:?}"),
+        }
+
+        // ---- IO expander + EPD/TP/NFC power and reset ----
+        let mut ioe = Ioe1::new(RefCellDevice::new(bus));
+        match ioe.init(&mut delay) {
+            Ok(uid) => info!("IOE1 ok: uid=0x{uid:04X} rev={}", ioe.rev().unwrap_or(0)),
+            Err(e) => error!("IOE1 init failed: {e:?}"),
+        }
+        if let Err(e) = epd_power_on(&mut ioe, &mut delay) {
+            error!("EPD power-on via IOE1 failed: {e:?}");
+        }
+        if let Err(e) = nfc_power(&mut ioe, true) {
+            error!("NFC power-on via IOE1 failed: {e:?}");
+        }
+
+        // ---- SSD1677 over SPI2 ----
+        let spi = Spi::new(p.SPI2, SpiConfig::default().with_frequency(Rate::from_mhz(20)).with_mode(SpiMode::_0))
+            .expect("spi config")
+            .with_sck(p.GPIO15)
+            .with_mosi(p.GPIO14);
+        let dc = Output::new(p.GPIO17, Level::Low, OutputConfig::default());
+        let cs = Output::new(p.GPIO16, Level::High, OutputConfig::default());
+        let busy = Input::new(p.GPIO18, InputConfig::default().with_pull(Pull::Up));
+        let mut epd = Ssd1677::new(spi, dc, cs, busy);
+        match epd.init(&mut delay) {
+            Ok(()) => info!("EPD init ok"),
+            Err(e) => error!("EPD init failed: {e:?}"),
+        }
+
+        // ---- Touch (needs its own reset: ~300 ms boot time) ----
+        let tp_int = Input::new(p.GPIO4, InputConfig::default().with_pull(Pull::Up));
+        if let Err(e) = touch_reset(&mut ioe, &mut delay) {
+            error!("touch reset failed: {e:?}");
+        }
+        let mut ft = Ft6336::new(RefCellDevice::new(bus));
+        let touch = match ft.init(&mut delay) {
+            Ok(id) => {
+                info!("Touch ok: chip=0x{id:02X} vendor=0x{:02X}", ft.vendor_id().unwrap_or(0));
+                Some(ft)
+            }
+            Err(e) => {
+                error!("Touch init failed: {e:?}");
+                None
+            }
+        };
+
+        // ---- NFC (Pro model only) ----
+        delay.delay_ms(50);
+        let mut st25 = St25r3916::new(RefCellDevice::new(bus));
+        let nfc = match st25.init(&mut delay).and_then(|()| st25.configure_nfca(&mut delay)) {
+            Ok(()) => {
+                let (opc, aux, regd) = st25.status().unwrap_or((0, 0, 0));
+                info!(
+                    "NFC ok: identity=0x{:02X} op_ctrl=0x{opc:02X} aux=0x{aux:02X} reg=0x{regd:02X}",
+                    st25.identity().unwrap_or(0)
+                );
+                Some(st25)
+            }
+            Err(e) => {
+                warn!("NFC init failed (Lite model?): {e:?}");
+                None
+            }
+        };
+
+        let button_a = Input::new(p.GPIO2, InputConfig::default().with_pull(Pull::Up));
+        let button_b = Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up));
+
+        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, button_a, button_b }
+    }
+}
+
+/// PM1/IOE1 left in 400 kHz mode by an earlier firmware: talk to them at
+/// 400 kHz just long enough to clear their SPD bit, then return to 100 kHz.
+fn recover_i2c_speed(bus: &Bus, delay: &mut Delay) {
+    use crate::i2c_reg;
+    let fast = I2cConfig::default().with_frequency(Rate::from_khz(400));
+    let slow = I2cConfig::default().with_frequency(Rate::from_khz(100));
+    {
+        let mut b = bus.borrow_mut();
+        if let Err(e) = b.apply_config(&fast) {
+            warn!("apply_config(400k) failed: {e:?}");
+            return;
+        }
+        let r1 = i2c_reg::write_u8(&mut *b, crate::pm1::ADDR, crate::pm1::regs::I2C_CFG, 0x00);
+        let r2 = i2c_reg::write_u8(&mut *b, crate::ioe1::ADDR, crate::ioe1::regs::I2C_CFG, 0x00);
+        info!("I2C speed recovery: pm1={r1:?} ioe1={r2:?}");
+        delay.delay_ms(10);
+        let _ = b.apply_config(&slow);
+    }
+    delay.delay_ms(10);
 }
 
 /// Bring up the e-paper and touch power/reset lines through the IOE1 and

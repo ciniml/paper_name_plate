@@ -7,11 +7,13 @@
 //! - `ft6336`   : FT6336G touch controller (I2C 0x38)
 //! - `st25r3916`: ST25R3916 NFC reader (I2C 0x50), NFC-A UID reading
 //! - `ssd1677`  : SSD1677 e-paper controller (800x480 native, 4-gray) + framebuffer
-//! - `board`    : PaperMono pin map and bring-up sequence (esp-hal specific)
+//! - `board`    : PaperMono pin map, bring-up sequence and `Board` (esp-hal specific)
+//! - `app`      : demo application loop and UI (esp-hal specific)
 #![no_std]
 
 extern crate alloc;
 
+pub mod app;
 pub mod board;
 pub mod ft6336;
 pub mod i2c_reg;
