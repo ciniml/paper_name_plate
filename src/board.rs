@@ -83,6 +83,18 @@ pub fn nfc_power<I: I2c>(ioe: &mut Ioe1<I>, on: bool) -> Result<(), I::Error> {
     ioe.write(ioe::NFC_EN, on)
 }
 
+/// Reset only the touch controller with FT6336-appropriate timing.
+/// Call with TP_EN already high; the controller needs ~300 ms afterwards
+/// before its registers are valid.
+pub fn touch_reset<I: I2c>(ioe: &mut Ioe1<I>, delay: &mut impl DelayNs) -> Result<(), I::Error> {
+    ioe.set_output(ioe::TP_RST)?;
+    ioe.write(ioe::TP_RST, false)?;
+    delay.delay_ms(10);
+    ioe.write(ioe::TP_RST, true)?;
+    delay.delay_ms(300);
+    Ok(())
+}
+
 /// Pulse EPD_RST (and TP_RST) low; required to leave SSD1677 deep sleep.
 pub fn epd_hard_reset<I: I2c>(ioe: &mut Ioe1<I>, delay: &mut impl DelayNs) -> Result<(), I::Error> {
     ioe.write(ioe::EPD_RST, false)?;

@@ -29,6 +29,7 @@ use log::{error, info, warn};
 use static_cell::StaticCell;
 
 use paper_name_plate::board;
+use paper_name_plate::ft6336::{Ft6336, TouchPoint};
 use paper_name_plate::ioe1::Ioe1;
 use paper_name_plate::pm1::Pm1;
 use paper_name_plate::ssd1677::{FrameBuffer, GrayMode, Ssd1677, HEIGHT, WIDTH};
@@ -130,6 +131,38 @@ fn main() -> ! {
     }
 
     // ---------------------------------------------------------------
+    // Touch controller (reset/powered together with the EPD above)
+    // ---------------------------------------------------------------
+    let _tp_int = Input::new(p.GPIO4, InputConfig::default().with_pull(Pull::Up));
+    if let Err(e) = board::touch_reset(&mut ioe, &mut delay) {
+        error!("touch reset failed: {e:?}");
+    }
+    let mut touch = Ft6336::new(RefCellDevice::new(&i2c_bus));
+    let touch_ok = match touch.init(&mut delay) {
+        Ok(id) => {
+            info!("Touch ok: chip=0x{id:02X} vendor=0x{:02X}", touch.vendor_id().unwrap_or(0));
+            if id == 0 {
+                // Diagnostic: dump the working/ID register ranges.
+                let mut line = String::new();
+                for r in 0x00u8..0x10 {
+                    let _ = write!(line, "{:02X} ", touch.read_reg(r).unwrap_or(0xEE));
+                }
+                info!("FT6336 regs 0x00-0x0F: {line}");
+                line.clear();
+                for r in 0x80u8..0xB0 {
+                    let _ = write!(line, "{:02X} ", touch.read_reg(r).unwrap_or(0xEE));
+                }
+                info!("FT6336 regs 0x80-0xAF: {line}");
+            }
+            true
+        }
+        Err(e) => {
+            error!("Touch init failed: {e:?}");
+            false
+        }
+    };
+
+    // ---------------------------------------------------------------
     // NFC reader (Pro model only; Lite has no ST25R3916)
     // ---------------------------------------------------------------
     delay.delay_millis(50); // let the ST25R3916 power up
@@ -185,12 +218,36 @@ fn main() -> ! {
     let mut last_seen = Instant::now();
     let mut polls: u32 = 0;
     let mut epd_sleeping = false;
+    let mut frontlight_on = false;
+    let mut touch_down = false;
 
     loop {
         delay.delay_millis(if epd_sleeping { 500 } else { 200 });
         if !nfc_ok {
             continue;
         }
+        // Touch: a tap toggles the front light (and proves the driver works).
+        // TD_STATUS is polled directly; the INT line is left for a future
+        // interrupt-driven version.
+        if touch_ok {
+            let mut pts = [TouchPoint::default(); 2];
+            match touch.read(&mut pts) {
+                Ok(n) if n > 0 => {
+                    if !touch_down {
+                        touch_down = true;
+                        frontlight_on = !frontlight_on;
+                        info!("Touch at ({}, {}) -> frontlight {}", pts[0].x, pts[0].y, frontlight_on);
+                        let _ = pm1.set_frontlight(if frontlight_on { 128 } else { 0 });
+                        last_seen = Instant::now(); // keep the EPD awake while interacted with
+                    }
+                }
+                Ok(_) => touch_down = false,
+                Err(e) => log::debug!("touch read: {e:?}"),
+            }
+        } else {
+            touch_down = false;
+        }
+
         polls += 1;
         if !epd_sleeping && last_seen.elapsed().as_millis() > EPD_IDLE_SLEEP_MS {
             info!("EPD: idle -> deep sleep");
