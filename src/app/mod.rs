@@ -21,6 +21,14 @@ const EPD_IDLE_SLEEP_MS: u64 = 60_000;
 const FASTEST_PER_FULL: u32 = 10;
 /// A tag is considered gone after not answering for this long.
 const TAG_FORGET_MS: u64 = 1_500;
+/// With no tag present the RF field is only pulsed on for each poll
+/// (duty cycling); polling then slows down to this period.
+const IDLE_POLL_MS: u32 = 500;
+/// Poll period while a tag is (or was just) present.
+const ACTIVE_POLL_MS: u32 = 200;
+/// After switching the field on, give phones (card emulation needs to boot)
+/// this long before the first WUPA. Physical tags would need ~5 ms.
+const FIELD_SETTLE_MS: u32 = 80;
 
 static FRAMEBUFFER: StaticCell<FrameBuffer> = StaticCell::new();
 /// Copy of what is currently on the panel (baseline for differential updates).
@@ -34,10 +42,15 @@ pub struct App {
     tag_count: u32,
     fast_refreshes: u32,
     last_activity: Instant,
+    boot: Instant,
     polls: u32,
     epd_sleeping: bool,
     frontlight_on: bool,
     touch_down: bool,
+    /// Button A toggles: `true` = field always on (reference behaviour),
+    /// `false` = duty-cycled field when no tag is present.
+    field_always_on: bool,
+    btn_a_down: bool,
 }
 
 impl App {
@@ -50,10 +63,13 @@ impl App {
             tag_count: 0,
             fast_refreshes: 0,
             last_activity: Instant::now(),
+            boot: Instant::now(),
             polls: 0,
             epd_sleeping: false,
             frontlight_on: false,
             touch_down: false,
+            field_always_on: false,
+            btn_a_down: false,
         }
     }
 
@@ -77,19 +93,27 @@ impl App {
         let _ = b.pm1.set_frontlight(0);
 
         loop {
-            let ms = if self.epd_sleeping { 500 } else { 200 };
+            let ms = if self.last_tag.is_some() { ACTIVE_POLL_MS } else { IDLE_POLL_MS };
             self.board.delay.delay_ms(ms);
             self.polls += 1;
 
             self.handle_touch();
+            self.handle_buttons();
             self.manage_epd_sleep();
             self.poll_nfc();
 
-            if self.polls.is_multiple_of(300)
-                && let Some(nfc) = self.board.nfc.as_mut()
-            {
-                let (opc, aux, _) = nfc.status().unwrap_or((0, 0, 0));
-                info!("heartbeat: polls={} tags={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}", self.polls, self.tag_count);
+            if self.polls.is_multiple_of(60) {
+                let (opc, aux) = match self.board.nfc.as_mut() {
+                    Some(nfc) => nfc.status().map(|(o, a, _)| (o, a)).unwrap_or((0, 0)),
+                    None => (0, 0),
+                };
+                info!(
+                    "heartbeat: up={}s polls={} tags={} epd_sleep={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
+                    self.boot.elapsed().as_secs(),
+                    self.polls,
+                    self.tag_count,
+                    self.epd_sleeping
+                );
             }
         }
     }
@@ -112,6 +136,21 @@ impl App {
             Ok(_) => self.touch_down = false,
             Err(e) => log::debug!("touch read: {e:?}"),
         }
+    }
+
+    /// Button A (GPIO2, active low) toggles the field duty-cycling for A/B tests.
+    fn handle_buttons(&mut self) {
+        let down = self.board.button_a.is_low();
+        if down && !self.btn_a_down {
+            self.field_always_on = !self.field_always_on;
+            info!("Button A: field_always_on={}", self.field_always_on);
+            if self.field_always_on
+                && let Some(nfc) = self.board.nfc.as_mut()
+            {
+                let _ = nfc.field_on(&mut self.board.delay);
+            }
+        }
+        self.btn_a_down = down;
     }
 
     fn manage_epd_sleep(&mut self) {
@@ -142,7 +181,27 @@ impl App {
     fn poll_nfc(&mut self) {
         let b = &mut self.board;
         let Some(nfc) = b.nfc.as_mut() else { return };
-        match nfc.nfca_poll(&mut b.delay) {
+        // Duty-cycle the RF field: while no tag is around the field is only
+        // on during the poll itself (the ~100 mA TX driver dominates the
+        // board's idle power draw).
+        let duty_cycling = self.last_tag.is_none() && !self.field_always_on;
+        if duty_cycling {
+            if nfc.field_on(&mut b.delay).is_err() {
+                return;
+            }
+            b.delay.delay_ms(FIELD_SETTLE_MS);
+        }
+        let result = nfc.nfca_poll(&mut b.delay);
+        // Diagnostics: any RF activity short of a full detection.
+        let flags = nfc.last_request_irq;
+        // RXS | RXE | COL | error bits, i.e. a tag answered but activation failed.
+        if flags & 0x3400_F000 != 0 && !matches!(result, Ok(Some(_))) {
+            info!("NFC activity: irq=0x{flags:08X} duty={duty_cycling} result={result:?}");
+        }
+        if duty_cycling && matches!(result, Ok(None)) {
+            let _ = nfc.field_off();
+        }
+        match result {
             Ok(Some(tag)) => {
                 self.last_activity = Instant::now();
                 let same = self.last_tag.as_ref().is_some_and(|t| {

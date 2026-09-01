@@ -161,11 +161,13 @@ pub struct St25r3916<I2C> {
     addr: u8,
     /// Interrupt flags read from the chip but not yet consumed.
     pending_irq: u32,
+    /// Flags observed by the last `nfca_request` (diagnostics).
+    pub last_request_irq: u32,
 }
 
 impl<I2C: I2c> St25r3916<I2C> {
     pub fn new(i2c: I2C) -> Self {
-        Self { i2c, addr: ADDR, pending_irq: 0 }
+        Self { i2c, addr: ADDR, pending_irq: 0, last_request_irq: 0 }
     }
 
     pub fn release(self) -> I2C {
@@ -394,8 +396,10 @@ impl<I2C: I2c> St25r3916<I2C> {
     /// Switch the RF field on (reader mode: no collision avoidance, external
     /// field detector off) and wait the ISO14443 guard time.
     pub fn field_on(&mut self, delay: &mut impl DelayNs) -> Result<(), Error<I2C::Error>> {
+        // Note: AUX_DISPLAY.tx_on is not usable as a field indicator on this
+        // board (stays 0 while tags read fine), so trust tx_en.
         let v = self.read_reg(reg::OP_CONTROL)?;
-        if v & op::TX_EN != 0 && self.read_reg(reg::AUX_DISPLAY)? & 0x20 != 0 {
+        if v & op::TX_EN != 0 {
             return Ok(());
         }
         // en_fd_c = 00 (manual, FD off) so tx_en drives the field directly.
@@ -455,8 +459,9 @@ impl<I2C: I2c> St25r3916<I2C> {
         Ok((self.read_reg(reg::OP_CONTROL)?, self.read_reg(reg::AUX_DISPLAY)?, self.read_reg_b(0x2C)?))
     }
 
+    /// Switch the RF field off (tx_en/rx_en cleared; the chip stays in
+    /// Ready mode so [`Self::field_on`] is quick).
     pub fn field_off(&mut self) -> Result<(), I2C::Error> {
-        self.command(cmd::STOP_ALL)?;
         self.modify_reg(reg::OP_CONTROL, op::TX_EN | op::RX_EN, 0)
     }
 
@@ -514,6 +519,7 @@ impl<I2C: I2c> St25r3916<I2C> {
                 delay.delay_us(100);
             }
         }
+        self.last_request_irq = flags;
         if flags & irq::RXE == 0 {
             return Ok(None);
         }

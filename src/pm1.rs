@@ -47,6 +47,7 @@ pub mod regs {
     pub const GPIO_WAKE_EN: u8 = 0x18;
     pub const GPIO_WAKE_CFG: u8 = 0x19;
     pub const VREF_L: u8 = 0x20;
+    /// 16-bit little-endian mV (not 12-bit as the header comment suggests).
     pub const VBAT_L: u8 = 0x22;
     pub const VIN_L: u8 = 0x24;
     pub const V5VINOUT_L: u8 = 0x26;
@@ -172,24 +173,17 @@ impl<I2C: I2c> Pm1<I2C> {
         Ok(reg::read_u8(&mut self.i2c, self.addr, regs::PWR_SRC)? & 0x07)
     }
 
-    /// Battery voltage in millivolts (12-bit value).
+    /// Battery voltage in millivolts.
     ///
-    /// Right after PM1 wake-up the ADC sometimes returns a bogus low value
-    /// (tens of mV observed); retry a few times until it looks plausible.
+    /// The value needs 13 bits (a full battery is > 4095 mV; USB VIN is
+    /// ~5200 mV), so the whole 16-bit register pair is used.
     pub fn battery_mv(&mut self) -> Result<u16, I2C::Error> {
-        let mut v = 0;
-        for _ in 0..5 {
-            v = reg::read_u16_le(&mut self.i2c, self.addr, regs::VBAT_L)? & 0x0FFF;
-            if v >= 1000 {
-                break;
-            }
-        }
-        Ok(v)
+        reg::read_u16_le(&mut self.i2c, self.addr, regs::VBAT_L)
     }
 
     /// VIN (USB) voltage in millivolts.
     pub fn vin_mv(&mut self) -> Result<u16, I2C::Error> {
-        Ok(reg::read_u16_le(&mut self.i2c, self.addr, regs::VIN_L)? & 0x0FFF)
+        reg::read_u16_le(&mut self.i2c, self.addr, regs::VIN_L)
     }
 
     /// Configure GPIO3 as PWM0 output for the e-paper front light and set the
