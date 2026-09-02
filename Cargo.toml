@@ -28,6 +28,7 @@ embedded-hal       = "1.0"
 embedded-hal-bus   = "0.3"
 embedded-graphics  = "0.8"
 static_cell        = "2"
+u8g2-fonts         = { version = "0.8", features = ["embedded_graphics_textstyle"] }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

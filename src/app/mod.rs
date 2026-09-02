@@ -1,6 +1,7 @@
 //! Demo application: NFC-driven info display with touch-controlled front
 //! light and an idle deep-sleep policy for the e-paper panel.
 
+pub mod plate;
 pub mod ui;
 
 use embedded_hal::delay::DelayNs;
@@ -15,6 +16,7 @@ use crate::ndef;
 use crate::ssd1677::{FrameBuffer, GrayMode};
 use crate::st25r3916::{Error as NfcError, NfcaTag};
 use crate::t2t_emu::{Event as EmuEvent, T2tEmulator};
+use plate::PlateContent;
 
 /// EPD is put into deep sleep after this much time without activity.
 const EPD_IDLE_SLEEP_MS: u64 = 60_000;
@@ -61,6 +63,7 @@ pub struct App {
     emulate: bool,
     emu: T2tEmulator,
     emu_running: bool,
+    content: PlateContent,
 }
 
 impl App {
@@ -87,26 +90,23 @@ impl App {
             emulate: true,
             emu: T2tEmulator::new([0x04, 0x50, 0x41, 0x50, 0x45, 0x52, 0x01]),
             emu_running: false,
+            content: PlateContent::demo(),
         }
     }
 
     pub fn run(mut self) -> ! {
         let b = &mut self.board;
 
-        // Initial screen.
-        ui::draw_base_screen(self.fb, b.nfc.is_some());
+        // Initial screen: the name plate itself.
+        plate::draw(self.fb, &self.content);
         match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
             Ok(()) => info!("EPD initial refresh done"),
             Err(e) => error!("EPD refresh failed: {e:?}"),
         }
         self.displayed.copy_from(self.fb);
 
-        // Default tag content: a URL record.
-        let mut msg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        let url = b"github.com/esp-rs/esp-hal";
-        msg.extend_from_slice(&[0xD1, 0x01, (url.len() + 1) as u8, b'U', 0x04]); // MB|ME|SR, TNF=well-known, "U", https://
-        msg.extend_from_slice(url);
-        self.emu.set_ndef(&msg);
+        // Serve the plate content over NFC.
+        self.emu.set_ndef(&self.content.to_ndef());
 
         // Front light path check: brief blink.
         if let Err(e) = b.pm1.init_frontlight(5000) {
@@ -264,22 +264,26 @@ impl App {
         }
     }
 
-    /// The phone wrote to our emulated tag: show the new NDEF content.
+    /// The phone wrote to our emulated tag: adopt the new content and
+    /// re-render the plate.
     fn on_tag_written(&mut self) {
-        let summary = match self.emu.ndef() {
-            Some(m) => {
-                let s = ndef::summarize(m);
-                info!("T2T: new NDEF ({} B): {s}", m.len());
-                s
-            }
-            None => alloc::string::String::from("(tag erased)"),
-        };
+        if let Some(m) = self.emu.ndef() {
+            info!("T2T: new NDEF ({} B): {}", m.len(), ndef::summarize(m));
+            let m: alloc::vec::Vec<u8> = m.into();
+            self.content.apply_ndef(&m);
+        } else {
+            info!("T2T: NDEF erased; keeping current content");
+        }
+        // Normalise what we serve (canonical record layout).
+        self.emu.set_ndef(&self.content.to_ndef());
         self.wake_epd();
-        self.tag_count += 1;
-        let fake = NfcaTag { atqa: 0x0044, uid: [0; 10], uid_len: 0, sak: 0 };
-        ui::draw_tag_panel(self.fb, &fake, self.tag_count, None);
-        ui::draw_tag_detail(self.fb, &summary);
-        self.refresh_panel_region();
+        plate::draw(self.fb, &self.content);
+        let b = &mut self.board;
+        match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Text) {
+            Ok(()) => self.displayed.copy_from(self.fb),
+            Err(e) => error!("EPD refresh failed: {e:?}"),
+        }
+        self.fast_refreshes = 1;
     }
 
     fn manage_epd_sleep(&mut self) {

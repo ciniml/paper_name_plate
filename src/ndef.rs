@@ -155,7 +155,8 @@ fn ascii(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }).collect()
 }
 
-fn uri_prefix(code: u8) -> &'static str {
+/// NDEF URI identifier-code prefix table (subset).
+pub fn uri_prefix(code: u8) -> &'static str {
     match code {
         0x01 => "http://www.",
         0x02 => "https://www.",
