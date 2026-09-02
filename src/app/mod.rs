@@ -14,6 +14,7 @@ use crate::isodep::IsoDep;
 use crate::ndef;
 use crate::ssd1677::{FrameBuffer, GrayMode};
 use crate::st25r3916::{Error as NfcError, NfcaTag};
+use crate::t2t_emu::{Event as EmuEvent, T2tEmulator};
 
 /// EPD is put into deep sleep after this much time without activity.
 const EPD_IDLE_SLEEP_MS: u64 = 60_000;
@@ -51,6 +52,15 @@ pub struct App {
     /// `false` = duty-cycled field when no tag is present.
     field_always_on: bool,
     btn_a_down: bool,
+    btn_a_since: Instant,
+    btn_a_armed: bool,
+    /// Diagnostic: alternate emulation/reader every 10 s automatically.
+    auto_ab: bool,
+    auto_ab_since: Instant,
+    /// `true`: act as an NFC tag (name-plate mode); `false`: reader mode.
+    emulate: bool,
+    emu: T2tEmulator,
+    emu_running: bool,
 }
 
 impl App {
@@ -70,6 +80,13 @@ impl App {
             touch_down: false,
             field_always_on: false,
             btn_a_down: false,
+            btn_a_since: Instant::now(),
+            btn_a_armed: false,
+            auto_ab: false,
+            auto_ab_since: Instant::now(),
+            emulate: true,
+            emu: T2tEmulator::new([0x04, 0x50, 0x41, 0x50, 0x45, 0x52, 0x01]),
+            emu_running: false,
         }
     }
 
@@ -84,6 +101,13 @@ impl App {
         }
         self.displayed.copy_from(self.fb);
 
+        // Default tag content: a URL record.
+        let mut msg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let url = b"github.com/esp-rs/esp-hal";
+        msg.extend_from_slice(&[0xD1, 0x01, (url.len() + 1) as u8, b'U', 0x04]); // MB|ME|SR, TNF=well-known, "U", https://
+        msg.extend_from_slice(url);
+        self.emu.set_ndef(&msg);
+
         // Front light path check: brief blink.
         if let Err(e) = b.pm1.init_frontlight(5000) {
             warn!("frontlight init failed: {e:?}");
@@ -93,26 +117,50 @@ impl App {
         let _ = b.pm1.set_frontlight(0);
 
         loop {
-            let ms = if self.last_tag.is_some() { ACTIVE_POLL_MS } else { IDLE_POLL_MS };
-            self.board.delay.delay_ms(ms);
-            self.polls += 1;
+            if self.emulate {
+                // Tag emulation needs tight polling; touch/buttons are
+                // sampled every ~50 ms.
+                self.run_emulation_slice(50);
+                self.polls += 1;
+            } else {
+                let ms = if self.last_tag.is_some() { ACTIVE_POLL_MS } else { IDLE_POLL_MS };
+                self.board.delay.delay_ms(ms);
+                self.polls += 1;
+                self.poll_nfc();
+            }
 
             self.handle_touch();
             self.handle_buttons();
+            if self.auto_ab && self.auto_ab_since.elapsed().as_millis() > 10_000 {
+                self.auto_ab_since = Instant::now();
+                self.emulate = !self.emulate;
+                info!("AUTO A/B: emulate={}", self.emulate);
+                if !self.emulate {
+                    self.stop_emulation();
+                    if let Some(nfc) = self.board.nfc.as_mut() {
+                        let _ = nfc.configure_nfca(&mut self.board.delay);
+                    }
+                }
+            }
             self.manage_epd_sleep();
-            self.poll_nfc();
 
             if self.polls.is_multiple_of(60) {
-                let (opc, aux) = match self.board.nfc.as_mut() {
-                    Some(nfc) => nfc.status().map(|(o, a, _)| (o, a)).unwrap_or((0, 0)),
-                    None => (0, 0),
+                let (opc, aux, pta, irqs) = match self.board.nfc.as_mut() {
+                    Some(nfc) => (
+                        nfc.read_reg(0x02).unwrap_or(0),
+                        nfc.read_reg(0x31).unwrap_or(0),
+                        nfc.read_reg(0x21).unwrap_or(0),
+                        nfc.read_irq().unwrap_or(0),
+                    ),
+                    None => (0, 0, 0, 0),
                 };
                 info!(
-                    "heartbeat: up={}s polls={} tags={} epd_sleep={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
+                    "heartbeat: up={}s polls={} tags={} epd_sleep={} emu={:?} op_ctrl=0x{opc:02X} aux=0x{aux:02X} pta=0x{pta:02X} irq=0x{irqs:08X}",
                     self.boot.elapsed().as_secs(),
                     self.polls,
                     self.tag_count,
-                    self.epd_sleeping
+                    self.epd_sleeping,
+                    self.emu.state()
                 );
             }
         }
@@ -138,19 +186,100 @@ impl App {
         }
     }
 
-    /// Button A (GPIO2, active low) toggles the field duty-cycling for A/B tests.
+    /// Button A (GPIO2, active low) switches between tag emulation and reader
+    /// mode. Requires ~1 s hold so it cannot be toggled by accident while
+    /// handling the device.
     fn handle_buttons(&mut self) {
         let down = self.board.button_a.is_low();
         if down && !self.btn_a_down {
-            self.field_always_on = !self.field_always_on;
-            info!("Button A: field_always_on={}", self.field_always_on);
-            if self.field_always_on
-                && let Some(nfc) = self.board.nfc.as_mut()
-            {
-                let _ = nfc.field_on(&mut self.board.delay);
+            self.btn_a_since = Instant::now();
+            self.btn_a_armed = true;
+        }
+        if down && self.btn_a_down && self.btn_a_armed && self.btn_a_since.elapsed().as_millis() > 1000 {
+            self.btn_a_armed = false; // once per press
+            self.emulate = !self.emulate;
+            info!("Button A (held): emulate={}", self.emulate);
+            if !self.emulate {
+                self.stop_emulation();
+                if let Some(nfc) = self.board.nfc.as_mut() {
+                    let _ = nfc.configure_nfca(&mut self.board.delay);
+                }
             }
         }
         self.btn_a_down = down;
+    }
+
+    fn stop_emulation(&mut self) {
+        if self.emu_running
+            && let Some(nfc) = self.board.nfc.as_mut()
+        {
+            let _ = self.emu.stop(nfc);
+            self.emu_running = false;
+        }
+    }
+
+    /// Run the tag emulator for roughly `ms` milliseconds.
+    fn run_emulation_slice(&mut self, ms: u32) {
+        let b = &mut self.board;
+        let Some(nfc) = b.nfc.as_mut() else {
+            b.delay.delay_ms(ms);
+            return;
+        };
+        if !self.emu_running {
+            let _ = nfc.field_off();
+            match self.emu.start(nfc, &mut b.delay) {
+                Ok(()) => {
+                    info!("T2T emulation started, UID={}", ui::hex(&self.emu.uid()));
+                    self.emu_running = true;
+                }
+                Err(e) => {
+                    error!("T2T emulation start failed: {e:?}");
+                    b.delay.delay_ms(1000);
+                    return;
+                }
+            }
+        }
+        let t0 = Instant::now();
+        while t0.elapsed().as_millis() < ms as u64 {
+            match self.emu.update(nfc, &mut b.delay) {
+                Ok(EmuEvent::None) => b.delay.delay_ms(1),
+                Ok(EmuEvent::FieldOn) => info!("T2T: field on"),
+                Ok(EmuEvent::Selected) => {
+                    info!("T2T: selected by reader");
+                    self.last_activity = Instant::now();
+                }
+                Ok(EmuEvent::FieldOff { written }) => {
+                    info!("T2T: field off, {} commands, last=0x{:02X}, written={written}", self.emu.commands, self.emu.last_cmd);
+                    if written {
+                        self.on_tag_written();
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!("T2T update error: {e:?}");
+                    self.emu_running = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The phone wrote to our emulated tag: show the new NDEF content.
+    fn on_tag_written(&mut self) {
+        let summary = match self.emu.ndef() {
+            Some(m) => {
+                let s = ndef::summarize(m);
+                info!("T2T: new NDEF ({} B): {s}", m.len());
+                s
+            }
+            None => alloc::string::String::from("(tag erased)"),
+        };
+        self.wake_epd();
+        self.tag_count += 1;
+        let fake = NfcaTag { atqa: 0x0044, uid: [0; 10], uid_len: 0, sak: 0 };
+        ui::draw_tag_panel(self.fb, &fake, self.tag_count, None);
+        ui::draw_tag_detail(self.fb, &summary);
+        self.refresh_panel_region();
     }
 
     fn manage_epd_sleep(&mut self) {

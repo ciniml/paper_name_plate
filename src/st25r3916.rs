@@ -57,6 +57,9 @@ pub mod reg {
     pub const FIELD_THRESHOLD_DEACT: u8 = 0x2B;
     pub const AUX_DISPLAY: u8 = 0x31;
     pub const IC_IDENTITY: u8 = 0x3F;
+    pub const PT_DISPLAY: u8 = 0x21;
+    pub const BITRATE_DETECT: u8 = 0x24;
+    pub const IRQ_MASK_TARGET: u8 = 0x19;
     // space B
     pub const B_EMD_SUP_CONF: u8 = 0x05;
     pub const B_CORR_CONF1: u8 = 0x0C;
@@ -70,6 +73,9 @@ pub mod reg {
 
 pub mod cmd {
     pub const SET_DEFAULT: u8 = 0xC1;
+    pub const GO_TO_SENSE: u8 = 0xCD;
+    pub const GO_TO_SLEEP: u8 = 0xCE;
+    pub const UNMASK_RECEIVE_DATA: u8 = 0xD1;
     pub const STOP_ALL: u8 = 0xC2;
     pub const TRANSMIT_WITH_CRC: u8 = 0xC4;
     pub const TRANSMIT_WITHOUT_CRC: u8 = 0xC5;
@@ -96,6 +102,14 @@ pub mod irq {
     pub const PAR: u32 = 0x40 << 8;
     pub const ERR2: u32 = 0x20 << 8;
     pub const ERR1: u32 = 0x10 << 8;
+    /// Timer/NFC register: external field detected / dropped, bit rate found.
+    pub const EON: u32 = 0x10 << 16;
+    pub const EOF: u32 = 0x08 << 16;
+    pub const NFCT: u32 = 0x01 << 16;
+    /// Passive target register.
+    pub const RXE_PTA: u32 = 0x10;
+    pub const WU_AX: u32 = 0x02;
+    pub const WU_A: u32 = 0x01;
     /// Communication errors only (CRC, parity, framing); the low nibble of
     /// the error register holds wake-up flags, which are not errors.
     pub const ERROR_MASK: u32 = 0x0000_F000;
@@ -258,6 +272,15 @@ impl<I2C: I2c> St25r3916<I2C> {
 
     pub fn write_irq_mask(&mut self, mask: u32) -> Result<(), I2C::Error> {
         self.write_regs(reg::IRQ_MASK_MAIN, &mask.to_be_bytes())
+    }
+
+    /// Non-blocking: fold fresh interrupt flags into the pending set and
+    /// return (and consume) the ones matching `bits`.
+    pub fn take_irq(&mut self, bits: u32) -> Result<u32, I2C::Error> {
+        self.pending_irq |= self.read_irq()?;
+        let hit = self.pending_irq & bits;
+        self.pending_irq &= !hit;
+        Ok(hit)
     }
 
     /// Poll the interrupt registers until any of `bits` is set or `timeout_ms`
@@ -485,7 +508,26 @@ impl<I2C: I2c> St25r3916<I2C> {
         self.write_regs(reg::NO_RESPONSE_TIMER1, &nrt.to_be_bytes())
     }
 
-    fn set_num_tx(&mut self, bytes: u16, bits: u8) -> Result<(), I2C::Error> {
+    /// Load the passive-target "A" configuration (UID[10], ATQA[2], SAK[3]).
+    pub fn load_pt_mem_a(&mut self, data: &[u8]) -> Result<(), I2C::Error> {
+        self.i2c.transaction(self.addr, &mut [Operation::Write(&[0xA0]), Operation::Write(data)])
+    }
+
+    /// Transmit `data` from target mode: `bits == 0` → whole bytes with CRC,
+    /// otherwise `bits` bits of `data[0]` without CRC (4-bit ACK/NAK).
+    pub fn target_transmit(&mut self, data: &[u8], bits: u8) -> Result<(), I2C::Error> {
+        self.command(cmd::CLEAR_FIFO)?;
+        self.load_fifo(data)?;
+        if bits == 0 {
+            self.set_num_tx(data.len() as u16, 0)?;
+            self.command(cmd::TRANSMIT_WITH_CRC)
+        } else {
+            self.set_num_tx(0, bits)?;
+            self.command(cmd::TRANSMIT_WITHOUT_CRC)
+        }
+    }
+
+    pub fn set_num_tx(&mut self, bytes: u16, bits: u8) -> Result<(), I2C::Error> {
         let v = ((bytes & 0x1FF) << 3) | (bits as u16 & 0x07);
         self.write_regs(reg::NUM_TX_BYTES1, &v.to_be_bytes())
     }
