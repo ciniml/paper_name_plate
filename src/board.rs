@@ -25,6 +25,7 @@ use crate::ioe1::{Ioe1, Pin as IoePin};
 use crate::pm1::Pm1;
 use crate::ssd1677::Ssd1677;
 use crate::st25r3916::St25r3916;
+use esp_storage::FlashStorage;
 
 /// M5IOE1 pins (0-based; documentation label `PYGn` == index n-1).
 pub mod ioe {
@@ -106,6 +107,7 @@ pub struct Board {
     pub tp_int: Input<'static>,
     pub button_a: Input<'static>,
     pub button_b: Input<'static>,
+    pub flash: FlashStorage<'static>,
 }
 
 impl Board {
@@ -207,7 +209,25 @@ impl Board {
         let button_a = Input::new(p.GPIO2, InputConfig::default().with_pull(Pull::Up));
         let button_b = Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up));
 
-        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, button_a, button_b }
+        // Everything is up: switch PM1/IOE1 to their 400 kHz mode and run the
+        // whole bus at 400 kHz. NFC tag emulation needs the bandwidth (a T2T
+        // READ answer must go FIFO->air within a few ms). The SPD bit persists
+        // across ESP resets; the 100 kHz + recover_i2c_speed path at the top
+        // of init() copes with that on the next boot.
+        match (pm1.set_i2c_400k(&mut delay), ioe.set_i2c_400k(&mut delay)) {
+            (Ok(()), Ok(())) => {
+                let fast = I2cConfig::default().with_frequency(Rate::from_khz(400));
+                match bus.borrow_mut().apply_config(&fast) {
+                    Ok(()) => info!("I2C bus now 400 kHz"),
+                    Err(e) => warn!("I2C 400 kHz switch failed: {e:?}"),
+                }
+            }
+            (a, b) => warn!("keeping I2C at 100 kHz (pm1={a:?} ioe1={b:?})"),
+        }
+
+        let flash = FlashStorage::new(p.FLASH);
+
+        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, button_a, button_b, flash }
     }
 }
 

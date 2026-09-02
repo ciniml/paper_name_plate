@@ -63,6 +63,8 @@ pub struct App {
     emulate: bool,
     emu: T2tEmulator,
     emu_running: bool,
+    /// Last time the emulator saw any field activity (for the re-init watchdog).
+    emu_last_field: Instant,
     content: PlateContent,
 }
 
@@ -90,12 +92,19 @@ impl App {
             emulate: true,
             emu: T2tEmulator::new([0x04, 0x50, 0x41, 0x50, 0x45, 0x52, 0x01]),
             emu_running: false,
+            emu_last_field: Instant::now(),
             content: PlateContent::demo(),
         }
     }
 
     pub fn run(mut self) -> ! {
         let b = &mut self.board;
+
+        // Restore persisted content, if any.
+        if let Some(stored) = crate::config_store::load(&mut b.flash) {
+            info!("config: restored {} B NDEF from flash", stored.len());
+            self.content.apply_ndef(&stored);
+        }
 
         // Initial screen: the name plate itself.
         plate::draw(self.fb, &self.content);
@@ -150,7 +159,7 @@ impl App {
                         nfc.read_reg(0x02).unwrap_or(0),
                         nfc.read_reg(0x31).unwrap_or(0),
                         nfc.read_reg(0x21).unwrap_or(0),
-                        nfc.read_irq().unwrap_or(0),
+                        nfc.peek_irq().unwrap_or(0),
                     ),
                     None => (0, 0, 0, 0),
                 };
@@ -239,16 +248,29 @@ impl App {
                 }
             }
         }
+        // Watchdog: if the reader field has not been seen for a long time the
+        // chip may be wedged in a way we cannot observe; re-init it.
+        if self.emu_last_field.elapsed().as_millis() > 120_000 {
+            info!("T2T: no field for 120 s -> re-init");
+            self.emu_last_field = Instant::now();
+            self.emu_running = false;
+            return;
+        }
         let t0 = Instant::now();
         while t0.elapsed().as_millis() < ms as u64 {
             match self.emu.update(nfc, &mut b.delay) {
                 Ok(EmuEvent::None) => b.delay.delay_ms(1),
-                Ok(EmuEvent::FieldOn) => info!("T2T: field on"),
+                Ok(EmuEvent::FieldOn) => {
+                    self.emu_last_field = Instant::now();
+                    info!("T2T: field on (up={}s)", self.boot.elapsed().as_secs());
+                }
                 Ok(EmuEvent::Selected) => {
                     info!("T2T: selected by reader");
                     self.last_activity = Instant::now();
+                    self.emu_last_field = Instant::now();
                 }
                 Ok(EmuEvent::FieldOff { written }) => {
+                    self.emu_last_field = Instant::now();
                     info!("T2T: field off, {} commands, last=0x{:02X}, written={written}", self.emu.commands, self.emu.last_cmd);
                     if written {
                         self.on_tag_written();
@@ -274,8 +296,13 @@ impl App {
         } else {
             info!("T2T: NDEF erased; keeping current content");
         }
-        // Normalise what we serve (canonical record layout).
-        self.emu.set_ndef(&self.content.to_ndef());
+        // Normalise what we serve (canonical record layout) and persist it.
+        let canonical = self.content.to_ndef();
+        self.emu.set_ndef(&canonical);
+        match crate::config_store::save(&mut self.board.flash, &canonical) {
+            Ok(()) => info!("config: saved {} B NDEF to flash", canonical.len()),
+            Err(e) => error!("config: save failed: {e:?}"),
+        }
         self.wake_epd();
         plate::draw(self.fb, &self.content);
         let b = &mut self.board;

@@ -18,6 +18,7 @@ extern crate alloc;
 
 pub mod app;
 pub mod board;
+pub mod config_store;
 pub mod ft6336;
 pub mod i2c_reg;
 pub mod ioe1;

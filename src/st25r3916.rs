@@ -274,6 +274,13 @@ impl<I2C: I2c> St25r3916<I2C> {
         self.write_regs(reg::IRQ_MASK_MAIN, &mask.to_be_bytes())
     }
 
+    /// Fold fresh flags into the pending set and return the whole set
+    /// WITHOUT consuming anything (safe for diagnostics/heartbeats).
+    pub fn peek_irq(&mut self) -> Result<u32, I2C::Error> {
+        self.pending_irq |= self.read_irq()?;
+        Ok(self.pending_irq)
+    }
+
     /// Non-blocking: fold fresh interrupt flags into the pending set and
     /// return (and consume) the ones matching `bits`.
     pub fn take_irq(&mut self, bits: u32) -> Result<u32, I2C::Error> {
