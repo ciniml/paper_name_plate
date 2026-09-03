@@ -106,7 +106,7 @@ src/
 5. **フロントライト** — 済: PM1 PWM0 で点灯確認。
 6. **NFC (ST25R3916, I2C)** — 済: UID 読み出し + ISO-DEP (RATS/APDU/WTX) + NDEF Type 4 読み出し実装（実データ検証は NDEF 公開デバイス待ち）。
 7. **タッチ (FT6336G)** — 済 (2026-09-01): `src/ft6336.rs`、リセット後 300 ms 待ちが必須。ポーリング方式。
-8. **省電力** — 済: EPD deep sleep（アイドル 60 s）、NFC フィールドのデューティサイクル（500 ms 周期、ON 80 ms）。未: ESP32 light sleep（USB ログが止まるため保留）、PM1 タイマー起床。
+8. **省電力** — 済: EPD deep sleep（アイドル 60 s）、NFC フィールドのデューティサイクル（500 ms 周期、ON 80 ms）。CPU 80 MHz 化 (2026-09-04)。未: ESP32 light sleep（USB ログが止まるため保留）、PM1 タイマー起床。
 
 ### 2.4 未確定事項 / リスク
 

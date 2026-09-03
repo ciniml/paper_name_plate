@@ -132,7 +132,9 @@ impl PlateContent {
                 (1, b"T") => {
                     let lang_len = (payload.first().copied().unwrap_or(0) & 0x3F) as usize;
                     if let Some(text) = payload.get(1 + lang_len..) {
-                        let text = String::from_utf8_lossy(text);
+                        // Some NFC writer apps make newlines hard to type:
+                        // accept ';' as an alternative separator.
+                        let text = String::from_utf8_lossy(text).replace(';', "\n");
                         let mut lines = text.lines();
                         self.name = lines.next().unwrap_or("").into();
                         self.title = lines.next().unwrap_or("").into();

@@ -23,7 +23,10 @@ esp_bootloader_esp_idf::esp_app_desc!();
 fn main() -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // 80 MHz halves the busy-loop power draw vs. 240 MHz; peripherals (SPI,
+    // I2C, RF) run from their own clocks so EPD/NFC behaviour is unchanged,
+    // rendering is merely a bit slower.
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz);
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
 
