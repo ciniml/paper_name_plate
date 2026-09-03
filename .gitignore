@@ -27,3 +27,6 @@ target/
 
 # work journal (local only)
 JOURNAL.md
+
+# generated NFC test asset
+test_image.b64.txt

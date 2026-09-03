@@ -54,6 +54,85 @@ fn is_plain_ascii(s: &str) -> bool {
     s.bytes().all(|b| (0x20..0x7F).contains(&b))
 }
 
+/// MIME type of the plate's image record.
+pub const IMAGE_MIME: &[u8] = b"image/x-plate";
+
+/// A 1-bpp image: rows padded to whole bytes, MSB first, 1 = black.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MonoImage {
+    pub width: u16,
+    pub height: u16,
+    pub bits: Vec<u8>,
+}
+
+impl MonoImage {
+    pub fn row_bytes(&self) -> usize {
+        (self.width as usize).div_ceil(8)
+    }
+
+    /// Parse `[w u16 LE][h u16 LE][rows]`; size-checked.
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 4 {
+            return None;
+        }
+        let width = u16::from_le_bytes([payload[0], payload[1]]);
+        let height = u16::from_le_bytes([payload[2], payload[3]]);
+        if width == 0 || height == 0 || width > 480 || height > 800 {
+            return None;
+        }
+        let need = (width as usize).div_ceil(8) * height as usize;
+        let bits = payload.get(4..4 + need)?.to_vec();
+        Some(Self { width, height, bits })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + self.bits.len());
+        v.extend_from_slice(&self.width.to_le_bytes());
+        v.extend_from_slice(&self.height.to_le_bytes());
+        v.extend_from_slice(&self.bits);
+        v
+    }
+}
+
+/// Minimal base64 (standard alphabet, '=' padding, whitespace ignored).
+fn b64_decode(s: &[u8]) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut n = 0;
+    for &c in s {
+        if c.is_ascii_whitespace() || c == b'=' {
+            continue;
+        }
+        acc = (acc << 6) | val(c)? as u32;
+        n += 1;
+        if n == 4 {
+            out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]);
+            acc = 0;
+            n = 0;
+        }
+    }
+    match n {
+        0 => {}
+        2 => out.push((acc >> 4) as u8),
+        3 => {
+            out.push((acc >> 10) as u8);
+            out.push((acc >> 2) as u8);
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlateContent {
     pub name: String,
@@ -61,6 +140,7 @@ pub struct PlateContent {
     pub org: String,
     pub note: String,
     pub url: String,
+    pub image: Option<MonoImage>,
 }
 
 impl PlateContent {
@@ -71,6 +151,7 @@ impl PlateContent {
             org: String::from("bare-metal Rust / esp-hal"),
             note: String::from("Tap your phone to get the link"),
             url: String::from("github.com/esp-rs/esp-hal"),
+            image: None,
         }
     }
 
@@ -98,7 +179,11 @@ impl PlateContent {
             first = false;
         }
         {
-            let mut hdr = 0x11 | 0x40; // SR, well-known, ME (last record)
+            let last = self.image.is_none();
+            let mut hdr = 0x11; // SR, well-known
+            if last {
+                hdr |= 0x40;
+            }
             if first {
                 hdr |= 0x80;
             }
@@ -109,6 +194,21 @@ impl PlateContent {
             msg.push(0x02); // UTF-8, lang length 2
             msg.extend_from_slice(b"en");
             msg.extend_from_slice(&text);
+        }
+        if let Some(img) = &self.image {
+            let payload = img.encode();
+            msg.push(0x12 | 0x40); // SR, MIME (TNF 2), ME
+            msg.push(IMAGE_MIME.len() as u8);
+            if payload.len() < 256 {
+                msg.push(payload.len() as u8);
+            } else {
+                // Long record: clear SR, 4-byte length.
+                let idx = msg.len() - 2;
+                msg[idx] &= !0x10;
+                msg.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            }
+            msg.extend_from_slice(IMAGE_MIME);
+            msg.extend_from_slice(&payload);
         }
         msg
     }
@@ -140,6 +240,22 @@ impl PlateContent {
                         self.title = lines.next().unwrap_or("").into();
                         self.org = lines.next().unwrap_or("").into();
                         self.note = lines.next().unwrap_or("").into();
+                    }
+                }
+                (2, t) if t == IMAGE_MIME => {
+                    // Raw binary, or "B64:<base64>" typed into an NFC writer.
+                    let decoded;
+                    let raw = if payload.starts_with(b"B64:") {
+                        decoded = b64_decode(&payload[4..]);
+                        decoded.as_deref()
+                    } else {
+                        Some(payload)
+                    };
+                    if let Some(img) = raw.and_then(MonoImage::decode) {
+                        log::info!("plate: image {}x{} ({} B)", img.width, img.height, img.bits.len());
+                        self.image = Some(img);
+                    } else {
+                        log::warn!("plate: bad image record ({} B)", payload.len());
                     }
                 }
                 (1, b"U") => {
@@ -283,6 +399,26 @@ pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
             FontColor::Transparent(Gray2::new(1)),
             fb,
         );
+    }
+
+    if let Some(img) = &c.image {
+        // Centered, 2x-scaled when small, in the area below the note.
+        let scale: i32 = if img.width <= 120 && img.height <= 100 { 2 } else { 1 };
+        let x0 = cx - (img.width as i32 * scale) / 2;
+        let y0 = 660 - (img.height as i32 * scale) / 2;
+        let rb = img.row_bytes();
+        for y in 0..img.height as i32 {
+            for x in 0..img.width as i32 {
+                let bit = img.bits[y as usize * rb + (x as usize >> 3)] & (0x80 >> (x & 7));
+                if bit != 0 {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            fb.set_pixel(x0 + x * scale + dx, y0 + y * scale + dy, 0);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Footer: NFC hint.
