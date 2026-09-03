@@ -1,6 +1,7 @@
 //! Demo application: NFC-driven info display with touch-controlled front
 //! light and an idle deep-sleep policy for the e-paper panel.
 
+pub mod ble;
 pub mod plate;
 pub mod ui;
 
@@ -16,7 +17,7 @@ use crate::ndef;
 use crate::ssd1677::{FrameBuffer, GrayMode};
 use crate::st25r3916::{Error as NfcError, NfcaTag};
 use crate::t2t_emu::{Event as EmuEvent, T2tEmulator};
-use plate::PlateContent;
+use plate::{MonoImage, PlateContent};
 
 /// EPD is put into deep sleep after this much time without activity.
 const EPD_IDLE_SLEEP_MS: u64 = 60_000;
@@ -72,8 +73,8 @@ impl App {
     pub fn new(board: Board) -> Self {
         Self {
             board,
-            fb: FRAMEBUFFER.init(FrameBuffer::new()),
-            displayed: DISPLAYED.init(FrameBuffer::new()),
+            fb: FrameBuffer::init_uninit(FRAMEBUFFER.uninit()),
+            displayed: FrameBuffer::init_uninit(DISPLAYED.uninit()),
             last_tag: None,
             tag_count: 0,
             fast_refreshes: 0,
@@ -105,6 +106,12 @@ impl App {
             info!("config: restored {} B NDEF from flash", stored.len());
             self.content.apply_ndef(&stored);
         }
+        if let Some(enc) = crate::config_store::load_image(&mut b.flash)
+            && let Some(img) = MonoImage::decode(&enc)
+        {
+            info!("config: restored {}x{} image from flash", img.width, img.height);
+            self.content.image = Some(img);
+        }
 
         // Initial screen: the name plate itself.
         plate::draw(self.fb, &self.content);
@@ -125,54 +132,101 @@ impl App {
         b.delay.delay_ms(300);
         let _ = b.pm1.set_frontlight(0);
 
-        loop {
-            if self.emulate {
-                // Tag emulation needs tight polling; touch/buttons are
-                // sampled every ~50 ms.
-                self.run_emulation_slice(50);
-                self.polls += 1;
-            } else {
-                let ms = if self.last_tag.is_some() { ACTIVE_POLL_MS } else { IDLE_POLL_MS };
-                self.board.delay.delay_ms(ms);
-                self.polls += 1;
-                self.poll_nfc();
-            }
+        self.main_loop()
+    }
 
-            self.handle_touch();
-            self.handle_buttons();
-            if self.auto_ab && self.auto_ab_since.elapsed().as_millis() > 10_000 {
-                self.auto_ab_since = Instant::now();
-                self.emulate = !self.emulate;
-                info!("AUTO A/B: emulate={}", self.emulate);
-                if !self.emulate {
-                    self.stop_emulation();
-                    if let Some(nfc) = self.board.nfc.as_mut() {
-                        let _ = nfc.configure_nfca(&mut self.board.delay);
-                    }
+    /// Dispatch to the BLE-enabled main loop, or the plain one if the radio
+    /// could not be brought up.
+    fn main_loop(&mut self) -> ! {
+        use esp_radio::ble::controller::BleConnector;
+        let connector = self.board.bt.take().and_then(|bt| match BleConnector::new(bt, Default::default()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                error!("BLE connector init failed: {e:?}");
+                None
+            }
+        });
+        match connector {
+            Some(c) => {
+                let hci = bleps::HciConnector::new(ble::BufferedHci::new(c), ble::millis);
+                info!("BLE ready (device name: {})", ble::DEVICE_NAME);
+                loop {
+                    self.ble_session(&hci);
                 }
             }
-            self.manage_epd_sleep();
+            None => loop {
+                self.tick(true, 20);
+            },
+        }
+    }
 
-            if self.polls.is_multiple_of(60) {
-                let (opc, aux, pta, irqs) = match self.board.nfc.as_mut() {
-                    Some(nfc) => (
-                        nfc.read_reg(0x02).unwrap_or(0),
-                        nfc.read_reg(0x31).unwrap_or(0),
-                        nfc.read_reg(0x21).unwrap_or(0),
-                        nfc.peek_irq().unwrap_or(0),
-                    ),
-                    None => (0, 0, 0, 0),
-                };
-                info!(
-                    "heartbeat: up={}s polls={} tags={} epd_sleep={} emu={:?} op_ctrl=0x{opc:02X} aux=0x{aux:02X} pta=0x{pta:02X} irq=0x{irqs:08X}",
-                    self.boot.elapsed().as_secs(),
-                    self.polls,
-                    self.tag_count,
-                    self.epd_sleeping,
-                    self.emu.state()
-                );
+    /// One iteration of the application work (touch, buttons, EPD sleep,
+    /// NFC emulation/reader, heartbeat). `allow_emulation == false` skips the
+    /// time-consuming NFC slice (used while BLE transfers are in flight).
+    fn tick(&mut self, allow_emulation: bool, emu_ms: u32) {
+        if self.emulate {
+            if allow_emulation {
+                self.run_emulation_slice(emu_ms);
+            } else {
+                self.board.delay.delay_ms(1);
+            }
+            self.polls += 1;
+        } else {
+            let ms = if self.last_tag.is_some() { ACTIVE_POLL_MS } else { IDLE_POLL_MS };
+            self.board.delay.delay_ms(ms);
+            self.polls += 1;
+            self.poll_nfc();
+        }
+
+        self.handle_touch();
+        self.handle_buttons();
+        if self.auto_ab && self.auto_ab_since.elapsed().as_millis() > 10_000 {
+            self.auto_ab_since = Instant::now();
+            self.emulate = !self.emulate;
+            info!("AUTO A/B: emulate={}", self.emulate);
+            if !self.emulate {
+                self.stop_emulation();
+                if let Some(nfc) = self.board.nfc.as_mut() {
+                    let _ = nfc.configure_nfca(&mut self.board.delay);
+                }
             }
         }
+        self.manage_epd_sleep();
+
+        if self.polls.is_multiple_of(300)
+            && let Some(nfc) = self.board.nfc.as_mut()
+        {
+            let (opc, aux) = nfc.status().map(|(o, a, _)| (o, a)).unwrap_or((0, 0));
+            info!(
+                "heartbeat: up={}s polls={} tags={} epd_sleep={} emu={:?} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
+                self.boot.elapsed().as_secs(),
+                self.polls,
+                self.tag_count,
+                self.epd_sleeping,
+                self.emu.state()
+            );
+        }
+    }
+
+    /// A complete image arrived over BLE: persist, adopt and redraw.
+    pub(crate) fn on_ble_image(&mut self, img: MonoImage) {
+        info!("BLE image applied: {}x{} ({} B)", img.width, img.height, img.bits.len());
+        if let Err(e) = crate::config_store::save_image(&mut self.board.flash, &img.encode()) {
+            error!("image save failed: {e:?}");
+        }
+        self.content.image = Some(img);
+        let canonical = self.content.to_ndef();
+        self.emu.set_ndef(&canonical);
+        let _ = crate::config_store::save(&mut self.board.flash, &canonical);
+        self.wake_epd();
+        plate::draw(self.fb, &self.content);
+        let b = &mut self.board;
+        match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
+            Ok(()) => self.displayed.copy_from(self.fb),
+            Err(e) => error!("EPD refresh failed: {e:?}"),
+        }
+        self.fast_refreshes = 1;
+        self.last_activity = Instant::now();
     }
 
     /// A tap toggles the front light and counts as activity.

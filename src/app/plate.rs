@@ -197,6 +197,15 @@ impl PlateContent {
         }
         if let Some(img) = &self.image {
             let payload = img.encode();
+            if payload.len() > 700 {
+                // Too big for the NTAG user area: display-only.
+                if let Some(last) = msg.first_mut() {
+                    let _ = last;
+                }
+                // Fix the ME flag of the text record (it was cleared above).
+                fix_me_flag(&mut msg);
+                return msg;
+            }
             msg.push(0x12 | 0x40); // SR, MIME (TNF 2), ME
             msg.push(IMAGE_MIME.len() as u8);
             if payload.len() < 256 {
@@ -277,6 +286,23 @@ impl PlateContent {
     }
 }
 
+/// Set the ME (message end) flag on the last record header of `msg`.
+fn fix_me_flag(msg: &mut [u8]) {
+    let mut i = 0usize;
+    let mut last_hdr = None;
+    while i < msg.len() {
+        last_hdr = Some(i);
+        let Some((_, _, _, next)) = record_at(msg, i) else { break };
+        if next <= i || next >= msg.len() {
+            break;
+        }
+        i = next;
+    }
+    if let Some(h) = last_hdr {
+        msg[h] |= 0x40;
+    }
+}
+
 /// Parse the record at byte offset `i`; returns (tnf, type, payload, next offset).
 fn record_at(msg: &[u8], i: usize) -> Option<(u8, &[u8], &[u8], usize)> {
     let hdr = *msg.get(i)?;
@@ -305,9 +331,36 @@ fn record_at(msg: &[u8], i: usize) -> Option<(u8, &[u8], &[u8], usize)> {
     Some((tnf, rtype, payload, p + payload_len))
 }
 
+/// Draw `img` centered at (`cx`, `cy`), black pixels only.
+fn draw_image(fb: &mut FrameBuffer, img: &MonoImage, cx: i32, cy: i32, scale: i32) {
+    let x0 = cx - (img.width as i32 * scale) / 2;
+    let y0 = cy - (img.height as i32 * scale) / 2;
+    let rb = img.row_bytes();
+    for y in 0..img.height as i32 {
+        for x in 0..img.width as i32 {
+            let bit = img.bits[y as usize * rb + (x as usize >> 3)] & (0x80 >> (x & 7));
+            if bit != 0 {
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        fb.set_pixel(x0 + x * scale + dx, y0 + y * scale + dy, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render the full name-plate screen.
 pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
     fb.clear(Gray2::WHITE).ok();
+
+    // A large (near full-screen) image replaces the whole plate layout.
+    if let Some(img) = &c.image
+        && img.width >= 400
+    {
+        draw_image(fb, img, WIDTH as i32 / 2, HEIGHT as i32 / 2, 1);
+        return;
+    }
 
     let big = FontRenderer::new::<fonts::u8g2_font_logisoso42_tf>();
     let mid = FontRenderer::new::<fonts::u8g2_font_logisoso22_tf>();
@@ -404,21 +457,7 @@ pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
     if let Some(img) = &c.image {
         // Centered, 2x-scaled when small, in the area below the note.
         let scale: i32 = if img.width <= 120 && img.height <= 100 { 2 } else { 1 };
-        let x0 = cx - (img.width as i32 * scale) / 2;
-        let y0 = 660 - (img.height as i32 * scale) / 2;
-        let rb = img.row_bytes();
-        for y in 0..img.height as i32 {
-            for x in 0..img.width as i32 {
-                let bit = img.bits[y as usize * rb + (x as usize >> 3)] & (0x80 >> (x & 7));
-                if bit != 0 {
-                    for dy in 0..scale {
-                        for dx in 0..scale {
-                            fb.set_pixel(x0 + x * scale + dx, y0 + y * scale + dy, 0);
-                        }
-                    }
-                }
-            }
-        }
+        draw_image(fb, img, cx, 660, scale);
     }
 
     // Footer: NFC hint.

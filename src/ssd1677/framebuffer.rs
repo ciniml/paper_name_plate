@@ -124,6 +124,21 @@ impl FrameBuffer {
     }
 }
 
+impl FrameBuffer {
+    /// Initialise static storage **in place** (all white). `FrameBuffer` is
+    /// ~96 KiB; building one on the stack and moving it into a static (what
+    /// `StaticCell::init` does) overflows the main stack.
+    pub fn init_uninit(u: &'static mut core::mem::MaybeUninit<Self>) -> &'static mut Self {
+        let p = u.as_mut_ptr();
+        unsafe {
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).lsb) as *mut u8, 0xFF, PLANE_BYTES);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).msb) as *mut u8, 0xFF, PLANE_BYTES);
+            core::ptr::addr_of_mut!((*p).orientation).write(Orientation::default());
+            &mut *p
+        }
+    }
+}
+
 impl Default for FrameBuffer {
     fn default() -> Self {
         Self::new()

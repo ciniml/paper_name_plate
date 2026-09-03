@@ -15,6 +15,7 @@ use esp_hal::i2c::master::{Config as I2cConfig, I2c as EspI2c};
 use esp_hal::peripherals::Peripherals;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode as SpiMode;
+use esp_hal::timer::timg::TimerGroup;
 use esp_hal::time::Rate;
 use esp_hal::Blocking;
 use log::{error, info, warn};
@@ -108,6 +109,8 @@ pub struct Board {
     pub button_a: Input<'static>,
     pub button_b: Input<'static>,
     pub flash: FlashStorage<'static>,
+    /// Taken by the app to start BLE.
+    pub bt: Option<esp_hal::peripherals::BT<'static>>,
 }
 
 impl Board {
@@ -116,6 +119,12 @@ impl Board {
     /// touch -> NFC. Failures of optional parts are logged, not fatal.
     pub fn init(p: Peripherals) -> Self {
         let mut delay = Delay::new();
+
+        // Preemptive scheduler (required by esp-radio for BLE). The current
+        // context continues as the main task.
+        let timg0 = TimerGroup::new(p.TIMG0);
+        let sw_int = esp_hal::interrupt::software::SoftwareInterruptControl::new(p.SW_INTERRUPT);
+        esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
         // I2C @ 100 kHz. PM1/IOE1 default to 100 kHz and remember their SPD
         // (400 kHz) bit across ESP32 resets (the PMIC is always powered);
@@ -226,8 +235,9 @@ impl Board {
         }
 
         let flash = FlashStorage::new(p.FLASH);
+        let bt = Some(p.BT);
 
-        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, button_a, button_b, flash }
+        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, button_a, button_b, flash, bt }
     }
 }
 
