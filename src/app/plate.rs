@@ -19,6 +19,41 @@ use u8g2_fonts::{fonts, FontRenderer};
 
 use crate::ssd1677::{FrameBuffer, HEIGHT, WIDTH};
 
+/// Draw-target adapter that renders every pixel as a 2x2 block, giving a
+/// poor-man's 32 px Japanese font from the 16 px unifont.
+struct Scale2x<'a> {
+    fb: &'a mut FrameBuffer,
+}
+
+impl OriginDimensions for Scale2x<'_> {
+    fn size(&self) -> Size {
+        Size::new(WIDTH / 2, HEIGHT / 2)
+    }
+}
+
+impl DrawTarget for Scale2x<'_> {
+    type Color = Gray2;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(p, c) in pixels {
+            let (x, y) = (p.x * 2, p.y * 2);
+            self.fb.set_pixel(x, y, c.luma());
+            self.fb.set_pixel(x + 1, y, c.luma());
+            self.fb.set_pixel(x, y + 1, c.luma());
+            self.fb.set_pixel(x + 1, y + 1, c.luma());
+        }
+        Ok(())
+    }
+}
+
+fn is_plain_ascii(s: &str) -> bool {
+    s.bytes().all(|b| (0x20..0x7F).contains(&b))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlateContent {
     pub name: String,
@@ -159,6 +194,8 @@ pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
     let big = FontRenderer::new::<fonts::u8g2_font_logisoso42_tf>();
     let mid = FontRenderer::new::<fonts::u8g2_font_logisoso22_tf>();
     let small = FontRenderer::new::<fonts::u8g2_font_helvR14_tf>();
+    // 16 px font covering kana + JIS level 1/2 kanji (rendered 2x for names).
+    let jp = FontRenderer::new::<fonts::u8g2_font_b16_t_japanese2>();
 
     // Header band.
     let _ = Rectangle::new(Point::zero(), Size::new(WIDTH, 60))
@@ -174,30 +211,50 @@ pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
     );
 
     let cx = WIDTH as i32 / 2;
-    let _ = big.render_aligned(
-        c.name.as_str(),
-        Point::new(cx, 260),
-        VerticalPosition::Baseline,
-        HorizontalAlignment::Center,
-        FontColor::Transparent(Gray2::BLACK),
-        fb,
-    );
-    let _ = mid.render_aligned(
-        c.title.as_str(),
-        Point::new(cx, 330),
-        VerticalPosition::Baseline,
-        HorizontalAlignment::Center,
-        FontColor::Transparent(Gray2::new(1)),
-        fb,
-    );
-    let _ = mid.render_aligned(
-        c.org.as_str(),
-        Point::new(cx, 375),
-        VerticalPosition::Baseline,
-        HorizontalAlignment::Center,
-        FontColor::Transparent(Gray2::new(1)),
-        fb,
-    );
+    if is_plain_ascii(&c.name) {
+        let _ = big.render_aligned(
+            c.name.as_str(),
+            Point::new(cx, 260),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(Gray2::BLACK),
+            fb,
+        );
+    } else {
+        // Japanese name: 16 px font at 2x = 32 px, in scaled coordinates.
+        let _ = jp.render_aligned(
+            c.name.as_str(),
+            Point::new(cx / 2, 130),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(Gray2::BLACK),
+            &mut Scale2x { fb },
+        );
+    }
+    for (text, y) in [(&c.title, 330), (&c.org, 375)] {
+        if text.is_empty() {
+            continue;
+        }
+        if is_plain_ascii(text) {
+            let _ = mid.render_aligned(
+                text.as_str(),
+                Point::new(cx, y),
+                VerticalPosition::Baseline,
+                HorizontalAlignment::Center,
+                FontColor::Transparent(Gray2::new(1)),
+                fb,
+            );
+        } else {
+            let _ = jp.render_aligned(
+                text.as_str(),
+                Point::new(cx, y),
+                VerticalPosition::Baseline,
+                HorizontalAlignment::Center,
+                FontColor::Transparent(Gray2::new(1)),
+                fb,
+            );
+        }
+    }
 
     // Divider.
     let _ = Rectangle::new(Point::new(60, 430), Size::new(WIDTH - 120, 3))
@@ -215,7 +272,8 @@ pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
         );
     }
     if !c.note.is_empty() {
-        let _ = small.render_aligned(
+        let f = if is_plain_ascii(&c.note) { &small } else { &jp };
+        let _ = f.render_aligned(
             c.note.as_str(),
             Point::new(cx, 540),
             VerticalPosition::Baseline,
