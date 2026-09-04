@@ -8,8 +8,9 @@ pub mod ui;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use embedded_hal::delay::DelayNs;
-use esp_hal::rtc_cntl::sleep::{GpioWakeupSource, RtcSleepConfig, TimerWakeupSource};
-use esp_hal::rtc_cntl::{RwdtStage, RwdtStageAction};
+use esp_hal::gpio::RtcPinWithResistors;
+use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
+use esp_hal::rtc_cntl::SocResetReason;
 use esp_hal::time::{Duration, Instant};
 use log::{error, info, warn};
 use static_cell::StaticCell;
@@ -44,21 +45,18 @@ const IDLE_TICK_MS: u32 = 5;
 const NFC_SAFETY_POLL_MS: u64 = 250;
 /// Heartbeat log period.
 const HEARTBEAT_MS: u64 = 10_000;
-/// Master switch for doze mode. esp-hal 1.1's light sleep does not return
-/// on this board (see JOURNAL 2026-09-05: even a minimal program without
-/// RTOS/radio hangs on the second `sleep_light`), and a hung plate can only
-/// be recovered with a power cycle. Off until that is understood.
-const DOZE_ENABLED: bool = false;
-/// Doze (light sleep, BLE off) after this long without any activity
-/// (touch, button, NFC field, BLE traffic).
+/// Master switch for deep sleep when idle.
+const DOZE_ENABLED: bool = true;
+/// Deep sleep after this long without any activity (touch, button, NFC
+/// field, BLE traffic).
 pub(crate) const DOZE_AFTER_MS: u64 = 120_000;
-/// Never doze this soon after boot (keeps the USB console alive for
-/// development; light sleep drops the USB-JTAG link).
+/// Never sleep this soon after boot.
 const DOZE_MIN_UPTIME_MS: u64 = 60_000;
-/// Light-sleep chunk while dozing; GPIO wake sources cut it short.
-const DOZE_SLEEP_MS: u32 = 250;
-/// Bench doze test length (light sleeps).
-const DOZE_TEST_SLEEPS: u32 = 8;
+/// Periodic wake-up from deep sleep even without any event (safety net:
+/// re-arms NFC and lets BLE be reachable for a couple of minutes).
+const DEEP_SLEEP_PERIOD_S: u64 = 6 * 3600;
+/// Bench (BLE CTRL `05`): deep sleep with a short timer wake-up.
+const DEEP_SLEEP_TEST_S: u64 = 15;
 
 /// Microseconds the main task has spent sleeping (wraps; use deltas).
 static IDLE_US: AtomicU32 = AtomicU32::new(0);
@@ -72,9 +70,8 @@ pub(crate) fn idle_sleep_ms(ms: u32) {
     IDLE_US.fetch_add(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
 }
 
-/// Doze diagnostics that survive a reset (light sleep drops the USB console,
-/// so a crash inside doze would otherwise be invisible). Printed at boot.
-/// `[magic, stage, light_sleeps, last_sleep_rtc_ms, adv_off_result, total_doze_rtc_ms]`
+/// Sleep diagnostics that survive deep sleep / resets (RTC fast RAM).
+/// `[magic, stage, -, rtc_ms_at_sleep, adv_off_result, -]`; printed at boot.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static mut DOZE_DIAG: [u32; 8] = [0; 8];
 const DOZE_MAGIC: u32 = 0xD02E_0001;
@@ -106,10 +103,7 @@ fn doze_diag_report() {
     let cause = esp_hal::rtc_cntl::wakeup_cause();
     info!("boot: reset_reason={reason:?} wakeup_cause={cause:?}");
     if d[0] == DOZE_MAGIC {
-        warn!(
-            "boot: previous run ended in doze: stage={} light_sleeps={} last_sleep={}ms adv_off={} doze_total={}ms",
-            d[1], d[2], d[3], d[4], d[5]
-        );
+        info!("boot: previous run: stage={} slept_at_rtc={}ms adv_off={}", d[1], d[3], d[4]);
     }
     unsafe {
         (*core::ptr::addr_of_mut!(DOZE_DIAG)) = [0; 8];
@@ -153,15 +147,10 @@ pub struct App {
     nfc_last_poll: Instant,
     hb_last: Instant,
     hb_idle_us: u32,
-    /// Doze mode: BLE off, light sleep between NFC/touch/button checks.
-    dozing: bool,
-    /// Poll the NFC chip on the next tick regardless of the IRQ line
-    /// (set after each light sleep, whose wake reason we do not decode).
-    force_nfc_poll: bool,
-    light_sleeps: u32,
-    /// Bench: doze for a fixed number of light sleeps regardless of the
-    /// idle/USB conditions, then wake and report.
+    /// Bench: deep-sleep now with a short timer wake-up.
     pub(crate) doze_test: bool,
+    /// This boot is a wake-up from deep sleep (panel still shows the plate).
+    woke_from_deep_sleep: bool,
     /// A display image is stored in the flash image slot. Large images are
     /// not kept in `content.image` between redraws (see [`Self::draw_plate`]).
     image_in_flash: bool,
@@ -201,10 +190,8 @@ impl App {
             nfc_last_poll: Instant::now(),
             hb_last: Instant::now(),
             hb_idle_us: 0,
-            dozing: false,
-            force_nfc_poll: false,
-            light_sleeps: 0,
             doze_test: false,
+            woke_from_deep_sleep: false,
             image_in_flash: false,
         }
     }
@@ -234,6 +221,13 @@ impl App {
 
     pub fn run(mut self) -> ! {
         doze_diag_report();
+        self.woke_from_deep_sleep =
+            esp_hal::rtc_cntl::reset_reason(esp_hal::system::Cpu::ProCpu) == Some(SocResetReason::CoreDeepSleep);
+        if self.woke_from_deep_sleep {
+            // Leave a trace for the next boot's report (the console is not
+            // up yet when a wake-up boot logs).
+            doze_diag_set(1, 30);
+        }
         let b = &mut self.board;
 
         // Restore persisted content, if any.
@@ -247,25 +241,33 @@ impl App {
             self.image_in_flash = true;
         }
 
-        // Initial screen: the name plate itself.
+        // Initial screen: the name plate itself. After a deep-sleep wake-up
+        // the panel still shows exactly this, so skip the (slow, flashing)
+        // refresh and just rebuild the "displayed" baseline.
         plate::draw(self.fb, &self.content);
         self.trim_image();
         let b = &mut self.board;
-        match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
-            Ok(()) => info!("EPD initial refresh done"),
-            Err(e) => error!("EPD refresh failed: {e:?}"),
+        if self.woke_from_deep_sleep {
+            info!("EPD: woke from deep sleep, panel content kept");
+        } else {
+            match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
+                Ok(()) => info!("EPD initial refresh done"),
+                Err(e) => error!("EPD refresh failed: {e:?}"),
+            }
         }
         self.displayed.copy_from(self.fb);
 
         // Serve the plate content over NFC.
         self.emu.set_ndef(&self.content.to_ndef());
 
-        // Front light path check: brief blink.
+        // Front light path check: brief blink (not on a wake-up).
         if let Err(e) = b.pm1.init_frontlight(5000) {
             warn!("frontlight init failed: {e:?}");
         }
-        let _ = b.pm1.set_frontlight(64);
-        b.delay.delay_ms(300);
+        if !self.woke_from_deep_sleep {
+            let _ = b.pm1.set_frontlight(64);
+            b.delay.delay_ms(300);
+        }
         let _ = b.pm1.set_frontlight(0);
 
         self.main_loop()
@@ -289,7 +291,7 @@ impl App {
                 loop {
                     match self.ble_session(&hci) {
                         ble::SessionEnd::Restart => {}
-                        ble::SessionEnd::Doze => self.doze_session(),
+                        ble::SessionEnd::Doze => self.deep_sleep(),
                     }
                 }
             }
@@ -311,15 +313,11 @@ impl App {
                 let engaged = self.emu_running && self.emu.state() != crate::t2t_emu::State::Off;
                 let want = !self.emu_running
                     || engaged
-                    || self.force_nfc_poll
                     || self.board.nfc_irq.is_high()
                     || self.nfc_last_poll.elapsed().as_millis() > NFC_SAFETY_POLL_MS;
                 if want {
                     self.nfc_last_poll = Instant::now();
-                    self.force_nfc_poll = false;
                     self.run_emulation_slice(emu_ms);
-                } else if self.dozing {
-                    self.light_sleep(DOZE_SLEEP_MS);
                 } else {
                     idle_sleep_ms(IDLE_TICK_MS);
                 }
@@ -365,62 +363,49 @@ impl App {
             && !usb_host_active()
     }
 
-    /// Doze until something happens: NFC keeps working (the ST25R3916's
-    /// IRQ wakes the CPU), touch/buttons wake too. Any activity ends the
-    /// doze and the caller restarts BLE.
-    fn doze_session(&mut self) {
-        info!("doze: entering light sleep mode (BLE off)");
-        self.dozing = true;
-        let sleeps0 = self.light_sleeps;
-        let t0 = self.board.rtc.time_since_power_up();
-        doze_diag_set(1, 1);
-        // Safety net: the RTC watchdog keeps running through light sleep.
-        // If we ever fail to come back it resets the chip (RTC RAM and thus
-        // the doze diagnostics survive that) instead of leaving a brick.
-        {
-            let wdt = &mut self.board.rtc.rwdt;
-            wdt.set_timeout(RwdtStage::Stage0, Duration::from_secs(8));
-            wdt.set_stage_action(RwdtStage::Stage0, RwdtStageAction::ResetSystem);
-            wdt.enable();
+    /// Deep sleep until something happens: NFC reader field (ST25R3916 IRQ
+    /// high), touch (INT low), button A/B (low) or the periodic timer.
+    /// Waking is a reset; `run()` recognises it and keeps the panel as is.
+    fn deep_sleep(&mut self) -> ! {
+        let secs = if self.doze_test { DEEP_SLEEP_TEST_S } else { DEEP_SLEEP_PERIOD_S };
+        info!("deep sleep: entering (timer {secs} s, wake on NFC/touch/buttons)");
+        doze_diag_set(1, 20);
+        doze_diag_set(3, self.board.rtc.time_since_power_up().as_millis() as u32);
+        let _ = self.board.pm1.set_frontlight(0);
+        self.manage_epd_sleep_now();
+        // Let the log drain before the USB link dies.
+        self.board.delay.delay_ms(50);
+
+        let board::Board { rtc, wake_pins, .. } = &mut self.board;
+        let [nfc, tp, btn_a, btn_b] = wake_pins;
+        // Internal pull-ups for the active-low inputs while the digital
+        // GPIO block is off.
+        for p in [&*tp, &*btn_a, &*btn_b] {
+            p.rtcio_pullup(true);
+            p.rtcio_pulldown(false);
         }
-        while self.should_doze() {
-            self.board.rtc.rwdt.feed();
-            self.tick(true, 6);
-            doze_diag_set(5, (self.board.rtc.time_since_power_up() - t0).as_millis() as u32);
-            if self.doze_test && self.light_sleeps - sleeps0 >= DOZE_TEST_SLEEPS {
-                self.doze_test = false;
-                self.last_activity = Instant::now();
-            }
-        }
-        self.board.rtc.rwdt.disable();
-        self.dozing = false;
-        doze_diag_set(1, 9);
-        info!(
-            "doze: woke up after {} light sleeps ({} s); BLE back on",
-            self.light_sleeps - sleeps0,
-            (self.board.rtc.time_since_power_up() - t0).as_secs()
-        );
+        nfc.rtcio_pullup(false);
+        nfc.rtcio_pulldown(true);
+        let mut pins: [(&mut dyn esp_hal::gpio::RtcPin, WakeupLevel); 4] = [
+            (nfc, WakeupLevel::High),
+            (tp, WakeupLevel::Low),
+            (btn_a, WakeupLevel::Low),
+            (btn_b, WakeupLevel::Low),
+        ];
+        let rtcio = RtcioWakeupSource::new(&mut pins);
+        let timer = TimerWakeupSource::new(core::time::Duration::from_secs(secs));
+        rtc.sleep_deep(&[&rtcio, &timer])
     }
 
-    /// One light-sleep chunk. Wake on the RTC timer or any enabled GPIO
-    /// (see `Board::init`). `Instant` (SYSTIMER) does not advance while
-    /// asleep, so elapsed-time logic only counts awake time in doze.
-    fn light_sleep(&mut self, ms: u32) {
-        let timer = TimerWakeupSource::new(core::time::Duration::from_millis(ms as u64));
-        let gpio = GpioWakeupSource::new();
-        let cfg = RtcSleepConfig::default();
-        let t0 = self.board.rtc.time_since_power_up();
-        doze_diag_set(1, 2);
-        self.board.rtc.rwdt.feed();
-        // Enter with interrupts masked (as ESP-IDF does): a scheduler tick
-        // or radio interrupt landing between the sleep request and the
-        // actual power-down must not run half-configured.
-        critical_section::with(|_| self.board.rtc.sleep(&cfg, &[&timer, &gpio]));
-        doze_diag_set(1, 3);
-        self.light_sleeps += 1;
-        doze_diag_set(2, self.light_sleeps);
-        doze_diag_set(3, (self.board.rtc.time_since_power_up() - t0).as_millis() as u32);
-        self.force_nfc_poll = true;
+    /// Put the panel to sleep right away (if it is not already).
+    fn manage_epd_sleep_now(&mut self) {
+        if !self.epd_sleeping {
+            let b = &mut self.board;
+            if let Err(e) = b.epd.deep_sleep(&mut b.delay) {
+                error!("EPD deep sleep failed: {e:?}");
+            }
+            self.epd_sleeping = true;
+        }
     }
 
     /// Periodic status line, including the share of time the CPU spent
@@ -444,10 +429,9 @@ impl App {
             .map(|(o, a, _)| (o, a))
             .unwrap_or((0, 0));
         info!(
-            "heartbeat: up={}s rtc_up={}s idle={idle_pct}% lsleeps={} polls={} tags={} epd_sleep={} emu={:?} nfc_irq={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
+            "heartbeat: up={}s rtc_up={}s idle={idle_pct}% polls={} tags={} epd_sleep={} emu={:?} nfc_irq={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
             self.boot.elapsed().as_secs(),
             self.board.rtc.time_since_power_up().as_secs(),
-            self.light_sleeps,
             self.polls,
             self.tag_count,
             self.epd_sleeping,

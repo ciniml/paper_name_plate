@@ -10,7 +10,7 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::i2c::I2c;
 use embedded_hal_bus::i2c::RefCellDevice;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull, WakeEvent};
+use esp_hal::gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::i2c::master::{Config as I2cConfig, I2c as EspI2c};
 use esp_hal::peripherals::Peripherals;
@@ -112,8 +112,12 @@ pub struct Board {
     pub nfc_irq: Input<'static>,
     pub button_a: Input<'static>,
     pub button_b: Input<'static>,
-    /// RTC controller: light sleep entry (doze mode).
+    /// RTC controller: deep sleep entry.
     pub rtc: Rtc<'static>,
+    /// Second handles on the wake-up pins (NFC IRQ, touch INT, button A,
+    /// button B) for configuring RTC-IO wake-up before deep sleep. The
+    /// `Input`s above keep owning the pads at run time.
+    pub wake_pins: [AnyPin<'static>; 4],
     pub flash: FlashStorage<'static>,
     /// Taken by the app to start BLE.
     pub bt: Option<esp_hal::peripherals::BT<'static>>,
@@ -187,8 +191,18 @@ impl Board {
         }
 
         // ---- Touch (needs its own reset: ~300 ms boot time) ----
-        let mut tp_int = Input::new(p.GPIO4, InputConfig::default().with_pull(Pull::Up));
-        let mut nfc_irq = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::Down));
+        // SAFETY: the clones are only used to program RTC-IO wake-up right
+        // before deep sleep, when the `Input` drivers are no longer used.
+        let wake_pins: [AnyPin<'static>; 4] = unsafe {
+            [
+                p.GPIO6.clone_unchecked().into(),
+                p.GPIO4.clone_unchecked().into(),
+                p.GPIO2.clone_unchecked().into(),
+                p.GPIO3.clone_unchecked().into(),
+            ]
+        };
+        let tp_int = Input::new(p.GPIO4, InputConfig::default().with_pull(Pull::Up));
+        let nfc_irq = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::Down));
         if let Err(e) = touch_reset(&mut ioe, &mut delay) {
             error!("touch reset failed: {e:?}");
         }
@@ -222,8 +236,8 @@ impl Board {
             }
         };
 
-        let mut button_a = Input::new(p.GPIO2, InputConfig::default().with_pull(Pull::Up));
-        let mut button_b = Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up));
+        let button_a = Input::new(p.GPIO2, InputConfig::default().with_pull(Pull::Up));
+        let button_b = Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up));
 
         // Everything is up: switch PM1/IOE1 to their 400 kHz mode and run the
         // whole bus at 400 kHz. NFC tag emulation needs the bandwidth (a T2T
@@ -241,24 +255,12 @@ impl Board {
             (a, b) => warn!("keeping I2C at 100 kHz (pm1={a:?} ioe1={b:?})"),
         }
 
-        // Light-sleep wake-up on any of: NFC IRQ high (reader field), touch
-        // INT low, button A/B low.
-        for (pin, ev, name) in [
-            (&mut nfc_irq, WakeEvent::HighLevel, "NFC_IRQ"),
-            (&mut tp_int, WakeEvent::LowLevel, "TP_INT"),
-            (&mut button_a, WakeEvent::LowLevel, "BTN_A"),
-            (&mut button_b, WakeEvent::LowLevel, "BTN_B"),
-        ] {
-            if let Err(e) = pin.wakeup_enable(true, ev) {
-                warn!("{name}: wakeup_enable failed: {e:?}");
-            }
-        }
         let rtc = Rtc::new(p.LPWR);
 
         let flash = FlashStorage::new(p.FLASH);
         let bt = Some(p.BT);
 
-        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, nfc_irq, button_a, button_b, rtc, flash, bt }
+        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, nfc_irq, button_a, button_b, rtc, wake_pins, flash, bt }
     }
 }
 
