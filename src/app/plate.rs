@@ -85,6 +85,26 @@ impl MonoImage {
         Some(Self { width, height, bits })
     }
 
+    /// Like [`decode`](Self::decode) but reuses the payload's allocation
+    /// (no 48 KB copy for a full-screen image).
+    pub fn decode_owned(mut payload: Vec<u8>) -> Option<Self> {
+        if payload.len() < 4 {
+            return None;
+        }
+        let width = u16::from_le_bytes([payload[0], payload[1]]);
+        let height = u16::from_le_bytes([payload[2], payload[3]]);
+        if width == 0 || height == 0 || width > 480 || height > 800 {
+            return None;
+        }
+        let need = (width as usize).div_ceil(8) * height as usize;
+        if payload.len() < 4 + need {
+            return None;
+        }
+        payload.drain(..4);
+        payload.truncate(need);
+        Some(Self { width, height, bits: payload })
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(4 + self.bits.len());
         v.extend_from_slice(&self.width.to_le_bytes());
@@ -196,8 +216,9 @@ impl PlateContent {
             msg.extend_from_slice(&text);
         }
         if let Some(img) = &self.image {
-            let payload = img.encode();
-            if payload.len() > 700 {
+            // Size check before encoding: a full-screen image is 48 KB and
+            // must not be copied just to learn it does not fit the tag.
+            if 4 + img.bits.len() > 700 {
                 // Too big for the NTAG user area: display-only.
                 if let Some(last) = msg.first_mut() {
                     let _ = last;
@@ -206,6 +227,7 @@ impl PlateContent {
                 fix_me_flag(&mut msg);
                 return msg;
             }
+            let payload = img.encode();
             msg.push(0x12 | 0x40); // SR, MIME (TNF 2), ME
             msg.push(IMAGE_MIME.len() as u8);
             if payload.len() < 256 {

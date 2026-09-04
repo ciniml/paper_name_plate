@@ -55,21 +55,38 @@ fn load_rec(flash: &mut FlashStorage<'_>, offset: u32, max: usize, region: usize
     ((crc16(&data) & 0xFF) as u8 == crc).then_some(data)
 }
 
+/// Write one record whose payload is `prefix ++ data`.
+///
+/// The record header plus `prefix` go out in a first write and `data` in a
+/// second one, so a 48 KB image is never copied into a staging buffer
+/// (heap is tight with the BLE stack loaded).
 fn save_rec(
     flash: &mut FlashStorage<'_>,
     offset: u32,
     max: usize,
+    prefix: &[u8],
     data: &[u8],
 ) -> Result<(), esp_storage::FlashStorageError> {
-    let len = data.len().min(max);
-    let data = &data[..len];
-    let mut buf: Vec<u8> = Vec::with_capacity(HEADER + len);
-    buf.extend_from_slice(&MAGIC);
-    buf.extend_from_slice(&(len as u16).to_le_bytes());
-    buf.push((len >> 16) as u8 & 0x0F);
-    buf.push((crc16(data) & 0xFF) as u8);
-    buf.extend_from_slice(data);
-    flash.write(offset, &buf)
+    let len = (prefix.len() + data.len()).min(max);
+    let data = &data[..len - prefix.len()];
+    let mut crc: u16 = 0xFFFF;
+    for &b in prefix.iter().chain(data) {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+        }
+    }
+    let mut head: Vec<u8> = Vec::with_capacity(HEADER + prefix.len());
+    head.extend_from_slice(&MAGIC);
+    head.extend_from_slice(&(len as u16).to_le_bytes());
+    head.push((len >> 16) as u8 & 0x0F);
+    head.push((crc & 0xFF) as u8);
+    head.extend_from_slice(prefix);
+    flash.write(offset, &head)?;
+    if !data.is_empty() {
+        flash.write(offset + head.len() as u32, data)?;
+    }
+    Ok(())
 }
 
 /// Load the stored content record, if a valid one is present.
@@ -79,15 +96,25 @@ pub fn load(flash: &mut FlashStorage<'_>) -> Option<Vec<u8>> {
 
 /// Store the content record, replacing any previous one.
 pub fn save(flash: &mut FlashStorage<'_>, data: &[u8]) -> Result<(), esp_storage::FlashStorageError> {
-    save_rec(flash, REGION_OFFSET, MAX_DATA, data)
+    save_rec(flash, REGION_OFFSET, MAX_DATA, &[], data)
 }
 
-/// Load the stored display image (MonoImage::encode payload).
+/// Load the stored display image (MonoImage::encode payload:
+/// `w:u16 h:u16 bits`).
 pub fn load_image(flash: &mut FlashStorage<'_>) -> Option<Vec<u8>> {
     load_rec(flash, IMAGE_OFFSET, MAX_IMAGE, IMAGE_REGION)
 }
 
-/// Store the display image.
-pub fn save_image(flash: &mut FlashStorage<'_>, data: &[u8]) -> Result<(), esp_storage::FlashStorageError> {
-    save_rec(flash, IMAGE_OFFSET, MAX_IMAGE, data)
+/// Store the display image (`bits` = 1-bpp rows, MSB first) without
+/// copying it.
+pub fn save_image(
+    flash: &mut FlashStorage<'_>,
+    width: u16,
+    height: u16,
+    bits: &[u8],
+) -> Result<(), esp_storage::FlashStorageError> {
+    let mut wh = [0u8; 4];
+    wh[..2].copy_from_slice(&width.to_le_bytes());
+    wh[2..].copy_from_slice(&height.to_le_bytes());
+    save_rec(flash, IMAGE_OFFSET, MAX_IMAGE, &wh, bits)
 }

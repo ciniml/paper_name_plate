@@ -1,16 +1,37 @@
 //! BLE image transfer: a GATT service that receives a 1-bpp image.
 //!
-//! Protocol (all writes, little endian):
-//! * CTRL characteristic:
-//!   `01 w:u16 h:u16 len:u32` — start a transfer (`len` = row_bytes*h)
-//!   `02` — commit (apply if all bytes arrived), `03` — abort
-//! * DATA characteristic: sequential payload chunks
-//! * STATUS characteristic (read): `state:u8 received:u32 expected:u32`
-//!   (state: 0 idle, 1 receiving, 2 complete)
+//! Protocol v2 (all little endian). Windowed, acknowledged transfer:
+//!
+//! * CTRL characteristic (write / write-without-response):
+//!   * `10 w:u16 h:u16 len:u32 crc32:u32 ack_every:u8` — start a transfer
+//!     (`len` = row_bytes*h, `crc32` = IEEE CRC-32 of the payload,
+//!     `ack_every` = number of accepted DATA packets per acknowledgement,
+//!     0 → 8).
+//!   * `02` — commit: verify length + CRC and apply.
+//!   * `03` — abort.
+//!   * `04` — sync: request a STATUS notification now.
+//! * DATA characteristic (write-without-response): `off:u16 | payload`.
+//!   Packets must arrive in order (`off` == bytes received so far); an
+//!   out-of-order packet is dropped and answered with a STATUS notification
+//!   (NAK) carrying the offset the device actually expects.
+//! * STATUS characteristic (read / notify): `state:u8 received:u32 expected:u32`
+//!   state: 0 idle, 1 receiving, 2 committed, 3 CRC error, 4 commit with
+//!   missing data. A notification is sent after every `ack_every` accepted
+//!   packets, when the last byte arrives, on NAK, and after start/commit/
+//!   abort/sync.
+//!
+//! The client sends `ack_every` packets, waits for the STATUS notification
+//! whose `received` covers them, and continues (rewinding to `received` on a
+//! NAK). This gives back-pressure so the phone's write-without-response
+//! flood can never overrun the device, and every loss is detected and
+//! repaired within one window.
+//!
+//! The GATT table is built by hand (not with the `gatt!` macro) so the DATA
+//! and CTRL characteristics can declare the Write-Without-Response property
+//! (0x04); Android/Chrome refuses `writeValueWithoutResponse` otherwise.
 //!
 //! The BLE session runs interleaved with the normal app tick; while a
-//! transfer is in flight the NFC emulation slice is skipped so the HCI
-//! queue drains quickly.
+//! transfer is in flight nothing but the HCI pump runs.
 
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -20,18 +41,36 @@ use embedded_hal::delay::DelayNs;
 use bleps::ad_structure::{
     create_advertising_data, AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE,
 };
-use bleps::attribute_server::{AttributeServer, WorkResult};
+use bleps::att::Uuid;
+use bleps::attribute::Attribute;
+use bleps::attribute_server::{
+    AttributeServer, NotificationData, WorkResult, CHARACTERISTIC_UUID16, PRIMARY_SERVICE_UUID16,
+};
 use bleps::no_rng::NoRng;
-use bleps::{gatt, Ble, HciConnector};
+use bleps::{Ble, HciConnector};
 use esp_radio::ble::controller::BleConnector;
 use log::{error, info, warn};
 
 use super::plate::MonoImage;
 
-/// bleps reads HCI **one byte at a time**; if the underlying transport
-/// discards the rest of a packet on a short read, the stream desyncs
-/// ("Expected async data"). This adapter always pulls whole packets from the
-/// controller into a local buffer and serves them out byte-wise.
+/// HCI transport adapter between the esp-radio controller and bleps.
+///
+/// bleps reads HCI **one byte at a time** and expects every byte of a
+/// packet to be readable the instant it asks for it (it `unwrap()`s the
+/// reads inside a packet). Two things break that assumption with the raw
+/// [`BleConnector`] byte stream:
+///
+/// * `BleConnector::read` concatenates queued packets and may split one
+///   across two reads, so a short read desyncs the stream ("Expected async
+///   data").
+/// * A large ATT write (MTU 128) arrives as one L2CAP PDU split across
+///   several HCI ACL fragments (first + continuing). bleps reassembles them
+///   but panics if the continuation has not reached the host yet.
+///
+/// So this adapter pulls whole packets with `BleConnector::next`, waits for
+/// (and merges) ACL continuation fragments itself, and serves the finished
+/// packet byte-wise. Any other packet that arrives in between the fragments
+/// is queued behind the merged one.
 pub struct BufferedHci {
     inner: BleConnector<'static>,
     buf: [u8; 1024],
@@ -39,9 +78,67 @@ pub struct BufferedHci {
     end: usize,
 }
 
+const HCI_ACL: u8 = 0x02;
+const ACL_HDR: usize = 5; // type + handle/flags + length
+
 impl BufferedHci {
     pub fn new(inner: BleConnector<'static>) -> Self {
         Self { inner, buf: [0; 1024], start: 0, end: 0 }
+    }
+
+    fn acl_pb_flag(pkt: &[u8]) -> u8 {
+        (pkt[2] >> 4) & 0x3
+    }
+
+    /// Pull the next HCI packet from the controller into `buf`, completing
+    /// a fragmented ACL packet if necessary. Leaves `buf` empty (0 bytes)
+    /// when the controller has nothing queued.
+    fn fill(&mut self) -> Result<(), <Self as embedded_io_06::ErrorType>::Error> {
+        self.start = 0;
+        self.end = self.inner.next(&mut self.buf)?;
+        let n = self.end;
+        if n < ACL_HDR + 4 || self.buf[0] != HCI_ACL || Self::acl_pb_flag(&self.buf) == 0b01 {
+            return Ok(());
+        }
+        let acl_len = u16::from_le_bytes([self.buf[3], self.buf[4]]) as usize;
+        let want = u16::from_le_bytes([self.buf[5], self.buf[6]]) as usize + 4;
+        if acl_len >= want {
+            return Ok(());
+        }
+
+        // First fragment of a longer L2CAP PDU: gather the rest.
+        let deadline = millis() + 200;
+        let mut tmp = [0u8; 512];
+        let mut stray = [0u8; 512];
+        let mut stray_len = 0usize;
+        while self.end - ACL_HDR < want {
+            let m = self.inner.next(&mut tmp)?;
+            if m == 0 {
+                if millis() > deadline {
+                    warn!("HCI: ACL continuation timeout ({}/{} B)", self.end - ACL_HDR, want);
+                    break;
+                }
+                continue;
+            }
+            if m >= ACL_HDR && tmp[0] == HCI_ACL && Self::acl_pb_flag(&tmp) == 0b01 {
+                let payload = &tmp[ACL_HDR..m];
+                let k = payload.len().min(self.buf.len() - self.end);
+                self.buf[self.end..self.end + k].copy_from_slice(&payload[..k]);
+                self.end += k;
+            } else if stray_len + m <= stray.len() {
+                // e.g. an HCI event: keep it for after the merged packet.
+                stray[stray_len..stray_len + m].copy_from_slice(&tmp[..m]);
+                stray_len += m;
+            } else {
+                warn!("HCI: dropping {m}-byte packet during ACL reassembly");
+            }
+        }
+        let new_len = (self.end - ACL_HDR) as u16;
+        self.buf[3..5].copy_from_slice(&new_len.to_le_bytes());
+        let k = stray_len.min(self.buf.len() - self.end);
+        self.buf[self.end..self.end + k].copy_from_slice(&stray[..k]);
+        self.end += k;
+        Ok(())
     }
 }
 
@@ -52,8 +149,7 @@ impl embedded_io_06::ErrorType for BufferedHci {
 impl embedded_io_06::Read for BufferedHci {
     fn read(&mut self, out: &mut [u8]) -> Result<usize, Self::Error> {
         if self.start == self.end {
-            self.start = 0;
-            self.end = self.inner.read(&mut self.buf)?;
+            self.fill()?;
         }
         let n = out.len().min(self.end - self.start);
         out[..n].copy_from_slice(&self.buf[self.start..self.start + n]);
@@ -74,61 +170,149 @@ impl embedded_io_06::Write for BufferedHci {
 
 pub const DEVICE_NAME: &str = "PaperPlate";
 const MAX_IMAGE_BYTES: usize = 48_000; // 480x800 / 8
+const DEFAULT_ACK_EVERY: u8 = 8;
+
+/// 128-bit UUID `50415045-5250-4c41-5445-0000000000xx` ("PAPERPLATE"),
+/// in the little-endian byte order the ATT layer uses.
+const fn uuid_le(last: u8) -> [u8; 16] {
+    [
+        last, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x54, 0x41, 0x4c, 0x50, 0x52, 0x45, 0x50, 0x41,
+        0x50,
+    ]
+}
+const UUID_SVC: [u8; 16] = uuid_le(0x01);
+const UUID_CTRL: [u8; 16] = uuid_le(0x02);
+const UUID_DATA: [u8; 16] = uuid_le(0x03);
+const UUID_STATUS: [u8; 16] = uuid_le(0x04);
+
+// Attribute handles (1-based, in table order).
+const H_CTRL_VAL: u16 = 3;
+const H_DATA_VAL: u16 = 5;
+const H_STATUS_VAL: u16 = 7;
+
+const PROP_READ: u8 = 0x02;
+const PROP_WRITE_NO_RSP: u8 = 0x04;
+const PROP_WRITE: u8 = 0x08;
+const PROP_NOTIFY: u8 = 0x10;
+
+/// Characteristic declaration value: `props | value_handle:u16 | uuid128`.
+const fn char_decl(props: u8, value_handle: u16, uuid: [u8; 16]) -> [u8; 19] {
+    let mut d = [0u8; 19];
+    d[0] = props;
+    d[1] = value_handle as u8;
+    d[2] = (value_handle >> 8) as u8;
+    let mut i = 0;
+    while i < 16 {
+        d[3 + i] = uuid[i];
+        i += 1;
+    }
+    d
+}
 
 pub fn millis() -> u64 {
     esp_hal::time::Instant::now().duration_since_epoch().as_millis()
 }
 
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+const ST_IDLE: u8 = 0;
+const ST_RECEIVING: u8 = 1;
+const ST_COMMITTED: u8 = 2;
+const ST_CRC_ERROR: u8 = 3;
+const ST_INCOMPLETE: u8 = 4;
+
 #[derive(Default)]
 pub struct ImgRx {
-    receiving: bool,
+    state: u8,
     width: u16,
     height: u16,
     expected: usize,
+    crc: u32,
+    ack_every: u8,
     data: Vec<u8>,
     done: Option<MonoImage>,
     /// millis() of the last GATT interaction (for BLE-priority scheduling).
     last_ms: u64,
+    /// Client subscribed to STATUS notifications (CCCD).
+    notify_on: bool,
+    /// A STATUS notification should be sent at the next opportunity.
+    pending_ntf: bool,
+    /// Accepted packets since the last acknowledgement.
+    since_ack: u8,
+    /// A NAK was already sent for the current out-of-order streak.
+    nak_sent: bool,
 }
 
 impl ImgRx {
+    fn receiving(&self) -> bool {
+        self.state == ST_RECEIVING
+    }
+
     fn ctrl(&mut self, d: &[u8]) {
         self.last_ms = millis();
         match d.first() {
-            Some(0x01) if d.len() >= 9 => {
+            Some(0x10) if d.len() >= 14 => {
                 let w = u16::from_le_bytes([d[1], d[2]]);
                 let h = u16::from_le_bytes([d[3], d[4]]);
                 let len = u32::from_le_bytes([d[5], d[6], d[7], d[8]]) as usize;
+                let crc = u32::from_le_bytes([d[9], d[10], d[11], d[12]]);
+                let ack_every = if d[13] == 0 { DEFAULT_ACK_EVERY } else { d[13] };
                 let row_bytes = (w as usize).div_ceil(8);
                 if w == 0 || h == 0 || w > 480 || h > 800 || len != row_bytes * h as usize || len > MAX_IMAGE_BYTES {
                     warn!("BLE img: bad start {w}x{h} len={len}");
                     self.reset();
+                    self.pending_ntf = true;
                     return;
                 }
-                info!("BLE img: start {w}x{h} ({len} B)");
-                self.receiving = true;
+                info!("BLE img: start {w}x{h} ({len} B, ack every {ack_every})");
+                self.reset();
+                self.state = ST_RECEIVING;
                 self.width = w;
                 self.height = h;
                 self.expected = len;
+                self.crc = crc;
+                self.ack_every = ack_every;
                 self.data = Vec::with_capacity(len);
-                self.done = None;
+                self.pending_ntf = true;
             }
             Some(0x02) => {
-                if self.receiving && self.data.len() == self.expected {
-                    info!("BLE img: commit ({} B)", self.data.len());
+                if !self.receiving() {
+                    warn!("BLE img: commit while idle");
+                } else if self.data.len() != self.expected {
+                    warn!("BLE img: commit with {}/{} B", self.data.len(), self.expected);
+                    self.state = ST_INCOMPLETE;
+                    self.data = Vec::new();
+                } else if crc32(&self.data) != self.crc {
+                    warn!("BLE img: CRC mismatch");
+                    self.state = ST_CRC_ERROR;
+                    self.data = Vec::new();
+                } else {
+                    info!("BLE img: commit ({} B, CRC ok)", self.data.len());
+                    self.state = ST_COMMITTED;
                     self.done = Some(MonoImage {
                         width: self.width,
                         height: self.height,
                         bits: core::mem::take(&mut self.data),
                     });
-                } else {
-                    warn!("BLE img: commit with {}/{} B", self.data.len(), self.expected);
                 }
-                self.receiving = false;
+                self.pending_ntf = true;
             }
             Some(0x03) => {
                 info!("BLE img: abort");
                 self.reset();
+                self.pending_ntf = true;
+            }
+            Some(0x04) => {
+                self.pending_ntf = true;
             }
             _ => warn!("BLE img: unknown ctrl {d:02X?}"),
         }
@@ -136,17 +320,33 @@ impl ImgRx {
 
     fn push(&mut self, d: &[u8]) {
         self.last_ms = millis();
-        if self.receiving && self.data.len() + d.len() <= self.expected {
-            let before = self.data.len();
-            self.data.extend_from_slice(d);
-            // Throttled progress (every ~10%).
-            let step = (self.expected / 10).max(1);
-            if before / step != self.data.len() / step {
-                log::info!("BLE img: {}/{}", self.data.len(), self.expected);
-            }
-        } else {
-            log::warn!("BLE img: push dropped (recv={} have={} +{} exp={})", self.receiving, self.data.len(), d.len(), self.expected);
+        if !self.receiving() || d.len() < 3 {
+            return;
         }
+        let off = u16::from_le_bytes([d[0], d[1]]) as usize;
+        let payload = &d[2..];
+        if off == self.data.len() && self.data.len() + payload.len() <= self.expected {
+            self.data.extend_from_slice(payload);
+            self.nak_sent = false;
+            self.since_ack += 1;
+            if self.since_ack >= self.ack_every || self.data.len() == self.expected {
+                self.since_ack = 0;
+                self.pending_ntf = true;
+            }
+        } else if !self.nak_sent {
+            warn!("BLE img: NAK off={off} have={} +{} exp={}", self.data.len(), payload.len(), self.expected);
+            self.nak_sent = true;
+            self.since_ack = 0;
+            self.pending_ntf = true;
+        }
+    }
+
+    fn status_bytes(&self) -> [u8; 9] {
+        let mut out = [0u8; 9];
+        out[0] = self.state;
+        out[1..5].copy_from_slice(&(self.data.len() as u32).to_le_bytes());
+        out[5..9].copy_from_slice(&(self.expected as u32).to_le_bytes());
+        out
     }
 
     fn status(&mut self, out: &mut [u8]) -> usize {
@@ -154,20 +354,24 @@ impl ImgRx {
         if out.len() < 9 {
             return 0;
         }
-        out[0] = if self.done.is_some() {
-            2
-        } else if self.receiving {
-            1
-        } else {
-            0
-        };
-        out[1..5].copy_from_slice(&(self.data.len() as u32).to_le_bytes());
-        out[5..9].copy_from_slice(&(self.expected as u32).to_le_bytes());
+        out[..9].copy_from_slice(&self.status_bytes());
         9
     }
 
+    /// Take the pending STATUS notification, if the client subscribed.
+    fn take_notification(&mut self) -> Option<[u8; 9]> {
+        if !self.pending_ntf {
+            return None;
+        }
+        self.pending_ntf = false;
+        self.notify_on.then(|| self.status_bytes())
+    }
+
     fn reset(&mut self) {
+        let notify_on = self.notify_on;
         *self = Self::default();
+        self.notify_on = notify_on;
+        self.last_ms = millis();
     }
 }
 
@@ -198,31 +402,58 @@ impl super::App {
         log::debug!("BLE advertising as {DEVICE_NAME}");
 
         let rx = RefCell::new(ImgRx::default());
-        let mut wf_ctrl = |_offset: usize, data: &[u8]| {
-            rx.borrow_mut().ctrl(data);
-        };
-        let mut wf_data = |_offset: usize, data: &[u8]| {
-            rx.borrow_mut().push(data);
-        };
-        let mut rf_status = |_offset: usize, data: &mut [u8]| -> usize { rx.borrow_mut().status(data) };
+        let cccd = RefCell::new([0u8; 2]);
 
-        gatt!([service {
-            uuid: "50415045-5250-4c41-5445-000000000001",
-            characteristics: [
-                characteristic {
-                    uuid: "50415045-5250-4c41-5445-000000000002",
-                    write: wf_ctrl,
-                },
-                characteristic {
-                    uuid: "50415045-5250-4c41-5445-000000000003",
-                    write: wf_data,
-                },
-                characteristic {
-                    uuid: "50415045-5250-4c41-5445-000000000004",
-                    read: rf_status,
-                },
-            ],
-        },]);
+        // --- attribute table -------------------------------------------------
+        // 1: primary service
+        let mut svc_val: &[u8; 16] = &UUID_SVC;
+        // 2/3: CTRL declaration + value
+        let ctrl_decl = char_decl(PROP_WRITE | PROP_WRITE_NO_RSP, H_CTRL_VAL, UUID_CTRL);
+        let mut ctrl_decl_val: &[u8; 19] = &ctrl_decl;
+        let mut wf_ctrl = |_offset: usize, data: &[u8]| rx.borrow_mut().ctrl(data);
+        let mut ctrl_val = ((), &mut wf_ctrl, ());
+        // 4/5: DATA declaration + value
+        let data_decl = char_decl(PROP_WRITE | PROP_WRITE_NO_RSP, H_DATA_VAL, UUID_DATA);
+        let mut data_decl_val: &[u8; 19] = &data_decl;
+        let mut wf_data = |_offset: usize, data: &[u8]| rx.borrow_mut().push(data);
+        let mut data_val = ((), &mut wf_data, ());
+        // 6/7: STATUS declaration + value, 8: CCCD
+        let status_decl = char_decl(PROP_READ | PROP_NOTIFY, H_STATUS_VAL, UUID_STATUS);
+        let mut status_decl_val: &[u8; 19] = &status_decl;
+        let mut rf_status = |_offset: usize, out: &mut [u8]| -> usize { rx.borrow_mut().status(out) };
+        let mut nf_status = |enabled: bool| {
+            info!("BLE: STATUS notifications {}", if enabled { "on" } else { "off" });
+            rx.borrow_mut().notify_on = enabled;
+        };
+        let mut status_val = (&mut rf_status, (), &mut nf_status);
+        let mut rf_cccd = |offset: usize, out: &mut [u8]| -> usize {
+            let c = cccd.borrow();
+            if offset >= 2 {
+                return 0;
+            }
+            let n = (2 - offset).min(out.len());
+            out[..n].copy_from_slice(&c[offset..offset + n]);
+            n
+        };
+        let mut wf_cccd = |offset: usize, d: &[u8]| {
+            let mut c = cccd.borrow_mut();
+            if offset < 2 {
+                let n = (2 - offset).min(d.len());
+                c[offset..offset + n].copy_from_slice(&d[..n]);
+            }
+        };
+        let mut cccd_val = (&mut rf_cccd, &mut wf_cccd, ());
+
+        let mut gatt_attributes = [
+            Attribute::new(PRIMARY_SERVICE_UUID16, &mut svc_val),
+            Attribute::new(CHARACTERISTIC_UUID16, &mut ctrl_decl_val),
+            Attribute::new(Uuid::Uuid128(UUID_CTRL), &mut ctrl_val),
+            Attribute::new(CHARACTERISTIC_UUID16, &mut data_decl_val),
+            Attribute::new(Uuid::Uuid128(UUID_DATA), &mut data_val),
+            Attribute::new(CHARACTERISTIC_UUID16, &mut status_decl_val),
+            Attribute::new(Uuid::Uuid128(UUID_STATUS), &mut status_val),
+            Attribute::new(Uuid::Uuid16(0x2902), &mut cccd_val),
+        ];
 
         let mut rng = NoRng;
         let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut rng);
@@ -233,7 +464,11 @@ impl super::App {
             // central is serviced without the multi-ms stalls that make GATT
             // writes fail.
             for _ in 0..96 {
-                match srv.do_work() {
+                let ntf = rx
+                    .borrow_mut()
+                    .take_notification()
+                    .map(|b| NotificationData::new(H_STATUS_VAL, &b));
+                match srv.do_work_with_notification(ntf) {
                     Ok(WorkResult::GotDisconnected) => {
                         info!("BLE: disconnected");
                         return;
@@ -250,15 +485,32 @@ impl super::App {
                 }
             }
 
-            if let Some(img) = rx.borrow_mut().done.take() {
+            // Apply a committed image only after its STATUS notification went
+            // out (the e-paper refresh blocks the HCI pump for seconds).
+            let img = {
+                let mut r = rx.borrow_mut();
+                if r.pending_ntf {
+                    None
+                } else {
+                    r.done.take()
+                }
+            };
+            if let Some(img) = img {
                 self.on_ble_image(img);
+                rx.borrow_mut().state = ST_IDLE;
                 errors = 0;
             }
 
-            // Give the rest of the app a slice only when BLE is idle; while a
-            // central is active the slow NFC-emulation service would starve the
-            // link. Touch/buttons/heartbeat still run every iteration.
-            let ble_active = rx.borrow().receiving || millis().saturating_sub(rx.borrow().last_ms) < 3000;
+            // While a transfer is actively streaming, do NOTHING but pump HCI:
+            // even a 1-2 ms touch I2C read here lets the controller's RX queue
+            // overflow under the phone's write-without-response burst.
+            if rx.borrow().receiving() {
+                continue;
+            }
+
+            // Between transfers but with a central recently active: cheap
+            // housekeeping only, keep the link responsive.
+            let ble_active = millis().saturating_sub(rx.borrow().last_ms) < 3000;
             if ble_active {
                 self.tick_light();
             } else {
@@ -269,7 +521,7 @@ impl super::App {
         }
     }
 
-    /// Cheap housekeeping used while a BLE transfer is in progress: touch,
+    /// Cheap housekeeping used while a BLE central is active: touch,
     /// buttons and the sleep/heartbeat bookkeeping, but no NFC emulation.
     fn tick_light(&mut self) {
         self.handle_touch();

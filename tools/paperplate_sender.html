@@ -1,0 +1,409 @@
+<title>PaperPlate Sender</title>
+<style>
+  :root {
+    --paper: #FAFAF6;
+    --ink: #1C1C19;
+    --muted: #6E6E66;
+    --line: #D9D9D0;
+    --accent: #3A5A78;
+    --accent-ink: #FFFFFF;
+    --ok: #2E6B4F;
+    --err: #8C3B2E;
+    --card: #FFFFFF;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #191917;
+      --ink: #EAEAE2;
+      --muted: #9A9A90;
+      --line: #3A3A35;
+      --accent: #7FA6C9;
+      --accent-ink: #10151A;
+      --ok: #7FC9A4;
+      --err: #D98B7C;
+      --card: #20201D;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #191917;
+    --ink: #EAEAE2;
+    --muted: #9A9A90;
+    --line: #3A3A35;
+    --accent: #7FA6C9;
+    --accent-ink: #10151A;
+    --ok: #7FC9A4;
+    --err: #D98B7C;
+    --card: #20201D;
+  }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "IBM Plex Sans JP", "Hiragino Sans", sans-serif;
+    line-height: 1.6;
+    padding: 20px 16px 48px;
+  }
+  main { max-width: 560px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
+  h1 small { display: block; font-size: 13px; font-weight: 400; color: var(--muted); margin-top: 2px; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 16px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  section > h2 {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--muted); margin: 0;
+  }
+  label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  input[type="file"] { font-size: 13px; color: var(--ink); }
+  select, input[type="range"] { accent-color: var(--accent); }
+  select {
+    background: var(--card); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; font-size: 13px;
+  }
+  .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .preview-wrap { display: flex; justify-content: center; }
+  #preview {
+    border: 6px solid #2b2b28;
+    border-radius: 4px;
+    background: #fff;
+    image-rendering: pixelated;
+    max-width: 100%;
+    height: auto;
+  }
+  button {
+    font: inherit; font-weight: 600; font-size: 15px;
+    background: var(--accent); color: var(--accent-ink);
+    border: none; border-radius: 6px; padding: 12px 16px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  .progress {
+    height: 8px; border-radius: 4px; background: var(--line); overflow: hidden;
+  }
+  .progress > div { height: 100%; width: 0%; background: var(--accent); transition: width 0.15s; }
+  #log {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12px; color: var(--muted);
+    white-space: pre-wrap; margin: 0; max-height: 10em; overflow-y: auto;
+  }
+  #log .ok { color: var(--ok); }
+  #log .err { color: var(--err); }
+  .hint { font-size: 12px; color: var(--muted); margin: 0; }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;600&family=IBM+Plex+Mono&display=swap">
+
+<main>
+  <h1>PaperPlate Sender
+    <small>モノクロ画像を BLE でネームプレートへ送信</small>
+  </h1>
+
+  <section>
+    <h2>1. 画像</h2>
+    <label>ファイル <input type="file" id="file" accept="image/*"></label>
+    <div class="row">
+      <label>サイズ
+        <select id="size">
+          <option value="480x800" selected>全画面 480×800</option>
+          <option value="240x240">240×240</option>
+          <option value="160x160">160×160</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="dither" checked> ディザリング</label>
+      <label><input type="checkbox" id="invert"> 反転</label>
+    </div>
+    <label>しきい値 <input type="range" id="thresh" min="16" max="240" value="128"></label>
+    <div class="preview-wrap"><canvas id="preview" width="480" height="800"></canvas></div>
+    <p class="hint">プレビューが実際の表示（黒 = インク）です。</p>
+  </section>
+
+  <section>
+    <h2>2. 送信</h2>
+    <button id="send" disabled>接続して送信</button>
+    <div class="progress"><div id="bar"></div></div>
+    <pre id="log">画像を選ぶと送信できます。Android の Chrome で開いてください。</pre>
+  </section>
+</main>
+
+<script>
+"use strict";
+const SVC  = "50415045-5250-4c41-5445-000000000001";
+const CTRL = "50415045-5250-4c41-5445-000000000002";
+const DATA = "50415045-5250-4c41-5445-000000000003";
+const STAT = "50415045-5250-4c41-5445-000000000004";
+
+// Protocol v2 (see src/app/ble.rs): windowed transfer with acknowledgements.
+const ACK_EVERY = 16;     // packets per acknowledgement window
+const CHUNK_BIG = 123;    // data bytes per packet at MTU 128 (125 - 2 header)
+const CHUNK_SMALL = 18;   // data bytes per packet at MTU 23  (20 - 2 header)
+
+const fileEl = document.getElementById("file");
+const sizeEl = document.getElementById("size");
+const ditherEl = document.getElementById("dither");
+const invertEl = document.getElementById("invert");
+const threshEl = document.getElementById("thresh");
+const canvas = document.getElementById("preview");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+const sendBtn = document.getElementById("send");
+const bar = document.getElementById("bar");
+const logEl = document.getElementById("log");
+
+let srcImage = null;
+let packed = null; // { w, h, bytes: Uint8Array }
+
+function log(msg, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function targetSize() {
+  const [w, h] = sizeEl.value.split("x").map(Number);
+  return { w, h };
+}
+
+function render() {
+  if (!srcImage) return;
+  const { w, h } = targetSize();
+  canvas.width = w;
+  canvas.height = h;
+  canvas.style.width = (w >= 400 ? "240px" : w / 2 + "px");
+
+  // Cover-fit the source into the target.
+  const scale = Math.max(w / srcImage.width, h / srcImage.height);
+  const dw = srcImage.width * scale, dh = srcImage.height * scale;
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(srcImage, (w - dw) / 2, (h - dh) / 2, dw, dh);
+
+  const img = ctx.getImageData(0, 0, w, h);
+  const px = img.data;
+  const gray = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    gray[i] = 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+  }
+  const th = Number(threshEl.value);
+  const inv = invertEl.checked;
+  const rowBytes = Math.ceil(w / 8);
+  const bytes = new Uint8Array(rowBytes * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      let black;
+      if (ditherEl.checked) {
+        // Floyd–Steinberg
+        const old = gray[i];
+        black = old < th;
+        const nv = black ? 0 : 255;
+        const err = old - nv;
+        if (x + 1 < w) gray[i + 1] += err * 7 / 16;
+        if (y + 1 < h) {
+          if (x > 0) gray[i + w - 1] += err * 3 / 16;
+          gray[i + w] += err * 5 / 16;
+          if (x + 1 < w) gray[i + w + 1] += err * 1 / 16;
+        }
+      } else {
+        black = gray[i] < th;
+      }
+      if (inv) black = !black;
+      const v = black ? 0 : 255;
+      px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = v;
+      px[i * 4 + 3] = 255;
+      if (black) bytes[y * rowBytes + (x >> 3)] |= 0x80 >> (x & 7);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  packed = { w, h, bytes };
+  sendBtn.disabled = false;
+}
+
+fileEl.addEventListener("change", () => {
+  const f = fileEl.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  const im = new Image();
+  im.onload = () => { srcImage = im; render(); URL.revokeObjectURL(url); };
+  im.src = url;
+});
+for (const el of [sizeEl, ditherEl, invertEl, threshEl]) {
+  el.addEventListener("input", render);
+}
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+const STATE_NAMES = { 0: "idle", 1: "receiving", 2: "committed", 3: "CRC error", 4: "incomplete" };
+function parseStatus(v) {
+  return { state: v.getUint8(0), received: v.getUint32(1, true), expected: v.getUint32(5, true) };
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function send() {
+  if (!packed) return;
+  if (!navigator.bluetooth) {
+    log("このブラウザは Web Bluetooth に対応していません。Android の Chrome を使ってください。", "err");
+    return;
+  }
+  sendBtn.disabled = true;
+  bar.style.width = "0%";
+  let gatt = null;
+  try {
+    log("デバイスを選択してください…");
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "PaperPlate" }],
+      optionalServices: [SVC],
+    });
+    log("接続中…");
+    gatt = await device.gatt.connect();
+    const svc = await gatt.getPrimaryService(SVC);
+    const ctrl = await svc.getCharacteristic(CTRL);
+    const data = await svc.getCharacteristic(DATA);
+    const stat = await svc.getCharacteristic(STAT);
+
+    // --- STATUS notifications (acknowledgements) ----------------------
+    const queue = [];
+    let waiter = null;
+    stat.addEventListener("characteristicvaluechanged", ev => {
+      const st = parseStatus(ev.target.value);
+      if (waiter) { const w = waiter; waiter = null; w(st); } else queue.push(st);
+    });
+    let notifyOk = true;
+    try {
+      await stat.startNotifications();
+    } catch (e) {
+      notifyOk = false;
+      log("通知が使えないため、読み出しで進捗を確認します。");
+    }
+    function waitStatus(ms) {
+      return new Promise(res => {
+        if (queue.length) return res(queue.shift());
+        const h = st => { clearTimeout(t); res(st); };
+        const t = setTimeout(() => { if (waiter === h) { waiter = null; res(null); } }, ms);
+        waiter = h;
+      });
+    }
+    async function waitFor(pred, ms) {
+      const end = performance.now() + ms;
+      while (performance.now() < end) {
+        const st = await waitStatus(end - performance.now());
+        if (!st) return null;
+        if (pred(st)) return st;
+      }
+      return null;
+    }
+    async function readStatus() {
+      try { return parseStatus(await stat.readValue()); } catch (e) { return null; }
+    }
+    // Ask the device where it is: notification if possible, else a read.
+    async function syncStatus() {
+      let st = null;
+      if (notifyOk) {
+        try {
+          await ctrl.writeValueWithResponse(Uint8Array.of(0x04));
+          st = await waitFor(() => true, 1000);
+        } catch (e) { /* fall through to read */ }
+      }
+      return st || await readStatus();
+    }
+
+    // --- start ----------------------------------------------------------
+    const { w, h, bytes } = packed;
+    const crc = crc32(bytes);
+    const start = new Uint8Array(14);
+    const dv = new DataView(start.buffer);
+    start[0] = 0x10;
+    dv.setUint16(1, w, true);
+    dv.setUint16(3, h, true);
+    dv.setUint32(5, bytes.length, true);
+    dv.setUint32(9, crc, true);
+    start[13] = ACK_EVERY;
+    await ctrl.writeValueWithResponse(start);
+    let st = notifyOk ? await waitFor(s => s.state === 1, 2000) : null;
+    if (!st) st = await readStatus();
+    if (!st || st.state !== 1) throw new Error("デバイスが転送を開始しませんでした");
+    log(`転送開始: ${w}×${h} (${bytes.length} B)`);
+
+    // --- data: windows of ACK_EVERY packets, each acknowledged -----------
+    let chunk = CHUNK_BIG;
+    let off = 0;
+    let rewinds = 0;
+    const t0 = performance.now();
+    while (off < bytes.length) {
+      const burstStart = off;
+      for (let i = 0; i < ACK_EVERY && off < bytes.length; i++) {
+        const part = bytes.subarray(off, Math.min(off + chunk, bytes.length));
+        const pkt = new Uint8Array(2 + part.length);
+        pkt[0] = off & 0xFF;
+        pkt[1] = (off >> 8) & 0xFF;
+        pkt.set(part, 2);
+        try {
+          await data.writeValueWithoutResponse(pkt);
+        } catch (e) {
+          if (chunk > CHUNK_SMALL) {
+            // The link's MTU is smaller than expected: use small packets.
+            chunk = CHUNK_SMALL;
+            log("小さいパケットに切り替えます。");
+            break;
+          }
+          throw e;
+        }
+        off += part.length;
+      }
+      const burstEnd = off;
+      st = notifyOk ? await waitFor(s => s.received >= burstEnd, 1500) : null;
+      if (!st || st.received < burstEnd) {
+        st = await syncStatus();
+        if (!st) throw new Error("デバイスから応答がありません");
+        if (st.state !== 1) throw new Error("デバイスが転送を中断しました (" + (STATE_NAMES[st.state] || st.state) + ")");
+        if (st.received < burstEnd) {
+          rewinds++;
+          if (st.received === burstStart && chunk > CHUNK_SMALL) {
+            chunk = CHUNK_SMALL;
+            log("小さいパケットに切り替えます。");
+          }
+          off = st.received;
+        }
+      }
+      bar.style.width = (off / bytes.length * 100).toFixed(1) + "%";
+    }
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    log(`送信完了 ${bytes.length} B (${dt} 秒${rewinds ? `, 再送 ${rewinds} 回` : ""})`);
+
+    // --- commit: the device verifies the CRC and answers before refreshing
+    await ctrl.writeValueWithoutResponse(Uint8Array.of(0x02));
+    st = notifyOk ? await waitFor(s => s.state !== 1, 3000) : null;
+    if (!st) { await sleep(300); st = await readStatus(); }
+    if (st && st.state === 2) {
+      log("適用しました。数秒でプレートの表示が切り替わります。", "ok");
+    } else if (st) {
+      throw new Error("デバイスが画像を拒否しました (" + (STATE_NAMES[st.state] || st.state) + ")");
+    } else {
+      log("適用要求を送りました（確認は取れませんでした）。表示を確認してください。");
+    }
+    await sleep(300);
+  } catch (e) {
+    log("エラー: " + e.message, "err");
+  } finally {
+    try { if (gatt && gatt.connected) gatt.disconnect(); } catch (e) { /* ignore */ }
+    sendBtn.disabled = false;
+  }
+}
+sendBtn.addEventListener("click", send);
+</script>

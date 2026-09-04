@@ -67,7 +67,15 @@ pub struct App {
     /// Last time the emulator saw any field activity (for the re-init watchdog).
     emu_last_field: Instant,
     content: PlateContent,
+    /// A display image is stored in the flash image slot. Large images are
+    /// not kept in `content.image` between redraws (see [`Self::draw_plate`]).
+    image_in_flash: bool,
 }
+
+/// Images up to this many bytes stay resident in `content.image`; larger
+/// ones (a full screen is 48 KB) are re-read from flash for each redraw so
+/// that the heap can hold an incoming BLE image alongside the BLE stack.
+const IMAGE_KEEP_MAX: usize = 8192;
 
 impl App {
     pub fn new(board: Board) -> Self {
@@ -95,6 +103,30 @@ impl App {
             emu_running: false,
             emu_last_field: Instant::now(),
             content: PlateContent::demo(),
+            image_in_flash: false,
+        }
+    }
+
+    /// Render the plate into `fb`, temporarily loading a large image from
+    /// flash if it is not resident.
+    fn draw_plate(&mut self) {
+        let load = self.content.image.is_none() && self.image_in_flash;
+        if load {
+            self.content.image =
+                crate::config_store::load_image(&mut self.board.flash).and_then(MonoImage::decode_owned);
+        }
+        plate::draw(self.fb, &self.content);
+        if load {
+            self.content.image = None;
+        }
+    }
+
+    /// Drop a large image from memory once it is drawn and persisted.
+    fn trim_image(&mut self) {
+        if self.image_in_flash
+            && self.content.image.as_ref().is_some_and(|i| i.bits.len() > IMAGE_KEEP_MAX)
+        {
+            self.content.image = None;
         }
     }
 
@@ -106,15 +138,16 @@ impl App {
             info!("config: restored {} B NDEF from flash", stored.len());
             self.content.apply_ndef(&stored);
         }
-        if let Some(enc) = crate::config_store::load_image(&mut b.flash)
-            && let Some(img) = MonoImage::decode(&enc)
-        {
+        if let Some(img) = crate::config_store::load_image(&mut b.flash).and_then(MonoImage::decode_owned) {
             info!("config: restored {}x{} image from flash", img.width, img.height);
             self.content.image = Some(img);
+            self.image_in_flash = true;
         }
 
         // Initial screen: the name plate itself.
         plate::draw(self.fb, &self.content);
+        self.trim_image();
+        let b = &mut self.board;
         match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
             Ok(()) => info!("EPD initial refresh done"),
             Err(e) => error!("EPD refresh failed: {e:?}"),
@@ -211,8 +244,13 @@ impl App {
     /// A complete image arrived over BLE: persist, adopt and redraw.
     pub(crate) fn on_ble_image(&mut self, img: MonoImage) {
         info!("BLE image applied: {}x{} ({} B)", img.width, img.height, img.bits.len());
-        if let Err(e) = crate::config_store::save_image(&mut self.board.flash, &img.encode()) {
-            error!("image save failed: {e:?}");
+        // Free the previous image first: with the BLE stack loaded there is
+        // not enough heap for two full-screen images plus staging copies.
+        self.content.image = None;
+        log::debug!("heap: {}", esp_alloc::HEAP.stats());
+        match crate::config_store::save_image(&mut self.board.flash, img.width, img.height, &img.bits) {
+            Ok(()) => self.image_in_flash = true,
+            Err(e) => error!("image save failed: {e:?}"),
         }
         self.content.image = Some(img);
         let canonical = self.content.to_ndef();
@@ -220,6 +258,7 @@ impl App {
         let _ = crate::config_store::save(&mut self.board.flash, &canonical);
         self.wake_epd();
         plate::draw(self.fb, &self.content);
+        self.trim_image();
         let b = &mut self.board;
         match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
             Ok(()) => self.displayed.copy_from(self.fb),
@@ -357,8 +396,18 @@ impl App {
             Ok(()) => info!("config: saved {} B NDEF to flash", canonical.len()),
             Err(e) => error!("config: save failed: {e:?}"),
         }
+        // A (small) image delivered over NFC also goes to the image slot so
+        // the flash copy never disagrees with what is shown.
+        if let Some(img) = &self.content.image
+            && img.bits.len() <= IMAGE_KEEP_MAX
+        {
+            match crate::config_store::save_image(&mut self.board.flash, img.width, img.height, &img.bits) {
+                Ok(()) => self.image_in_flash = true,
+                Err(e) => error!("image save failed: {e:?}"),
+            }
+        }
         self.wake_epd();
-        plate::draw(self.fb, &self.content);
+        self.draw_plate();
         let b = &mut self.board;
         match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Text) {
             Ok(()) => self.displayed.copy_from(self.fb),
