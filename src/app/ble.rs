@@ -253,6 +253,9 @@ pub struct ImgRx {
     since_ack: u8,
     /// A NAK was already sent for the current out-of-order streak.
     nak_sent: bool,
+    /// Bench: CTRL `05` requests a short doze test (light sleep a few
+    /// times, then come back and report).
+    doze_test_req: bool,
 }
 
 impl ImgRx {
@@ -316,6 +319,10 @@ impl ImgRx {
             }
             Some(0x04) => {
                 self.pending_ntf = true;
+            }
+            Some(0x05) => {
+                info!("BLE: doze test requested");
+                self.doze_test_req = true;
             }
             _ => warn!("BLE img: unknown ctrl {d:02X?}"),
         }
@@ -552,6 +559,10 @@ impl super::App {
             if ble_active {
                 self.tick_light();
             } else {
+                if rx.borrow().doze_test_req {
+                    self.doze_test = true;
+                    break 'session SessionEnd::Doze;
+                }
                 if millis().saturating_sub(hci_last_ms) > super::DOZE_AFTER_MS && self.should_doze() {
                     break 'session SessionEnd::Doze;
                 }
@@ -559,6 +570,15 @@ impl super::App {
                 // continuous (discoverable) while NFC emulation still runs.
                 self.tick(true, 6);
             }
+        };
+
+        // The bench client disconnects right after asking: honour the
+        // request even when the session ended with the disconnect.
+        let end = if rx.borrow().doze_test_req {
+            self.doze_test = true;
+            SessionEnd::Doze
+        } else {
+            end
         };
 
         if matches!(end, SessionEnd::Doze) {

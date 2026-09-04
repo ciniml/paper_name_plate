@@ -131,7 +131,7 @@ src/
 - BLE と NFC タグエミュレーションは 1 コアで競合するため、BLE 接続中は NFC 待受を止めて BLE を優先する（`tick_light`）。受信中は HCI ポンプ以外を止める。
 - **メモリ**: ヒープ ~155KB に BLE スタック + 受信画像 48KB + 表示中画像 48KB は入らないため、8KB を超える画像は描画・保存後にヒープから捨て、再描画時にフラッシュから読み直す（`draw_plate`/`trim_image`）。フラッシュ保存はヘッダとデータを 2 回に分けて書きコピーを作らない。
 - **省電力（CPU/無線）**: メインループの busy 待ちを esp-rtos のタスク sleep（idle hook = WFI、tick 1 kHz）に置換。NFC チップは IRQ ピン(GPIO6)が High のとき・リーダ交信中・250 ms 毎の安全ポーリング時のみ I2C アクセス、タッチは INT(GPIO4) が Low のときのみ読む、HCI は受信キューにデータがあるときだけポンプ。BLE 広告間隔 200〜250 ms。TF カード電源(TF_EN)は切る。heartbeat の `idle=NN%` が sleep 比率（待機時 ~98%）。
-- **doze（light sleep）**: 無操作（タッチ/ボタン/NFC フィールド/BLE 通信なし）120 秒 かつ 起動 60 秒後 かつ **USB ホスト未接続**（USB-JTAG の SOF フレームカウンタで判定）で、BLE 広告を止めて 250 ms 単位の light sleep に入る（`doze_session`）。起床要因は RTC タイマ / NFC IRQ(GPIO6 High) / タッチ INT(GPIO4 Low) / ボタン A,B(Low)。NFC は doze 中もそのまま応答し、何か操作があれば BLE を再起動する。ESP32-S3 の BLE リンク層は CPU 上で動くため light sleep と両立せず（esp-radio の controller sleep フックは `todo!()`）、doze 中は BLE 不可。light sleep 中は USB-JTAG が切れるので、開発時（USB 接続中）は doze しない。
+- **doze（light sleep）**（`DOZE_ENABLED = false` で無効。esp-hal 1.1 の light sleep がこの基板で戻ってこないため。JOURNAL 2026-09-05 参照）: 無操作（タッチ/ボタン/NFC フィールド/BLE 通信なし）120 秒 かつ 起動 60 秒後 かつ **USB ホスト未接続**（USB-JTAG の SOF フレームカウンタで判定）で、BLE 広告を止めて 250 ms 単位の light sleep に入る（`doze_session`）。起床要因は RTC タイマ / NFC IRQ(GPIO6 High) / タッチ INT(GPIO4 Low) / ボタン A,B(Low)。NFC は doze 中もそのまま応答し、何か操作があれば BLE を再起動する。ESP32-S3 の BLE リンク層は CPU 上で動くため light sleep と両立せず（esp-radio の controller sleep フックは `todo!()`）、doze 中は BLE 不可。light sleep 中は USB-JTAG が切れるので、開発時（USB 接続中）は doze しない。
 
 ## 3. 参考資料
 

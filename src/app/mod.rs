@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use embedded_hal::delay::DelayNs;
 use esp_hal::rtc_cntl::sleep::{GpioWakeupSource, RtcSleepConfig, TimerWakeupSource};
+use esp_hal::rtc_cntl::{RwdtStage, RwdtStageAction};
 use esp_hal::time::{Duration, Instant};
 use log::{error, info, warn};
 use static_cell::StaticCell;
@@ -43,6 +44,11 @@ const IDLE_TICK_MS: u32 = 5;
 const NFC_SAFETY_POLL_MS: u64 = 250;
 /// Heartbeat log period.
 const HEARTBEAT_MS: u64 = 10_000;
+/// Master switch for doze mode. esp-hal 1.1's light sleep does not return
+/// on this board (see JOURNAL 2026-09-05: even a minimal program without
+/// RTOS/radio hangs on the second `sleep_light`), and a hung plate can only
+/// be recovered with a power cycle. Off until that is understood.
+const DOZE_ENABLED: bool = false;
 /// Doze (light sleep, BLE off) after this long without any activity
 /// (touch, button, NFC field, BLE traffic).
 pub(crate) const DOZE_AFTER_MS: u64 = 120_000;
@@ -51,6 +57,8 @@ pub(crate) const DOZE_AFTER_MS: u64 = 120_000;
 const DOZE_MIN_UPTIME_MS: u64 = 60_000;
 /// Light-sleep chunk while dozing; GPIO wake sources cut it short.
 const DOZE_SLEEP_MS: u32 = 250;
+/// Bench doze test length (light sleeps).
+const DOZE_TEST_SLEEPS: u32 = 8;
 
 /// Microseconds the main task has spent sleeping (wraps; use deltas).
 static IDLE_US: AtomicU32 = AtomicU32::new(0);
@@ -151,6 +159,9 @@ pub struct App {
     /// (set after each light sleep, whose wake reason we do not decode).
     force_nfc_poll: bool,
     light_sleeps: u32,
+    /// Bench: doze for a fixed number of light sleeps regardless of the
+    /// idle/USB conditions, then wake and report.
+    pub(crate) doze_test: bool,
     /// A display image is stored in the flash image slot. Large images are
     /// not kept in `content.image` between redraws (see [`Self::draw_plate`]).
     image_in_flash: bool,
@@ -193,6 +204,7 @@ impl App {
             dozing: false,
             force_nfc_poll: false,
             light_sleeps: 0,
+            doze_test: false,
             image_in_flash: false,
         }
     }
@@ -341,7 +353,11 @@ impl App {
 
     /// Everything quiet for long enough (and not too soon after boot)?
     pub(crate) fn should_doze(&self) -> bool {
-        self.emulate
+        if self.doze_test {
+            return true;
+        }
+        DOZE_ENABLED
+            && self.emulate
             && !self.touch_down
             && self.emu.state() == crate::t2t_emu::State::Off
             && self.boot.elapsed().as_millis() > DOZE_MIN_UPTIME_MS
@@ -358,10 +374,25 @@ impl App {
         let sleeps0 = self.light_sleeps;
         let t0 = self.board.rtc.time_since_power_up();
         doze_diag_set(1, 1);
+        // Safety net: the RTC watchdog keeps running through light sleep.
+        // If we ever fail to come back it resets the chip (RTC RAM and thus
+        // the doze diagnostics survive that) instead of leaving a brick.
+        {
+            let wdt = &mut self.board.rtc.rwdt;
+            wdt.set_timeout(RwdtStage::Stage0, Duration::from_secs(8));
+            wdt.set_stage_action(RwdtStage::Stage0, RwdtStageAction::ResetSystem);
+            wdt.enable();
+        }
         while self.should_doze() {
+            self.board.rtc.rwdt.feed();
             self.tick(true, 6);
             doze_diag_set(5, (self.board.rtc.time_since_power_up() - t0).as_millis() as u32);
+            if self.doze_test && self.light_sleeps - sleeps0 >= DOZE_TEST_SLEEPS {
+                self.doze_test = false;
+                self.last_activity = Instant::now();
+            }
         }
+        self.board.rtc.rwdt.disable();
         self.dozing = false;
         doze_diag_set(1, 9);
         info!(
@@ -380,7 +411,11 @@ impl App {
         let cfg = RtcSleepConfig::default();
         let t0 = self.board.rtc.time_since_power_up();
         doze_diag_set(1, 2);
-        self.board.rtc.sleep(&cfg, &[&timer, &gpio]);
+        self.board.rtc.rwdt.feed();
+        // Enter with interrupts masked (as ESP-IDF does): a scheduler tick
+        // or radio interrupt landing between the sleep request and the
+        // actual power-down must not run half-configured.
+        critical_section::with(|_| self.board.rtc.sleep(&cfg, &[&timer, &gpio]));
         doze_diag_set(1, 3);
         self.light_sleeps += 1;
         doze_diag_set(2, self.light_sleeps);
