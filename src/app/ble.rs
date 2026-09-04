@@ -47,7 +47,10 @@ use bleps::attribute_server::{
     AttributeServer, NotificationData, WorkResult, CHARACTERISTIC_UUID16, PRIMARY_SERVICE_UUID16,
 };
 use bleps::no_rng::NoRng;
-use bleps::{Ble, HciConnector};
+use bleps::{
+    AdvertisingFilterPolicy, AdvertisingParameters, AdvertisingType, Ble, HciConnector, OwnAddressType,
+    PeerAddressType,
+};
 use esp_radio::ble::controller::BleConnector;
 use log::{error, info, warn};
 
@@ -385,7 +388,25 @@ impl super::App {
             self.board.delay.delay_ms(1000);
             return;
         }
-        let _ = ble.cmd_set_le_advertising_parameters();
+        // 200-250 ms advertising interval (bleps' default is 160 ms): still
+        // found within a second by phones, noticeably less radio time.
+        // bleps (rev a5148d8) serialises the interval fields big-endian while
+        // HCI is little-endian, so pre-swap the bytes; without this the
+        // controller rejects the command (status 0x12).
+        let adv = AdvertisingParameters {
+            advertising_interval_min: 0x0140u16.swap_bytes(),
+            advertising_interval_max: 0x0190u16.swap_bytes(),
+            advertising_type: AdvertisingType::AdvInd,
+            own_address_type: OwnAddressType::Public,
+            peer_address_type: PeerAddressType::Public,
+            peer_address: [0; 6],
+            advertising_channel_map: 0x07,
+            filter_policy: AdvertisingFilterPolicy::All,
+        };
+        if let Err(e) = ble.cmd_set_le_advertising_parameters_custom(&adv) {
+            warn!("BLE adv params failed ({e:?}); using defaults");
+            let _ = ble.cmd_set_le_advertising_parameters();
+        }
         match create_advertising_data(&[
             AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
             AdStructure::CompleteLocalName(DEVICE_NAME),
@@ -460,14 +481,18 @@ impl super::App {
 
         let mut errors = 0u32;
         loop {
-            // Pump HCI hard so advertising stays continuous and a connected
-            // central is serviced without the multi-ms stalls that make GATT
-            // writes fail.
+            // Pump HCI while the controller has something for us (or we have
+            // a notification to send). Advertising runs in the controller on
+            // its own, so with nothing queued there is nothing to do and the
+            // main task can sleep.
             for _ in 0..96 {
                 let ntf = rx
                     .borrow_mut()
                     .take_notification()
                     .map(|b| NotificationData::new(H_STATUS_VAL, &b));
+                if ntf.is_none() && !esp_radio::ble::have_hci_read_data() {
+                    break;
+                }
                 match srv.do_work_with_notification(ntf) {
                     Ok(WorkResult::GotDisconnected) => {
                         info!("BLE: disconnected");
@@ -527,6 +552,6 @@ impl super::App {
         self.handle_touch();
         self.handle_buttons();
         self.manage_epd_sleep();
-        self.board.delay.delay_ms(1);
+        super::idle_sleep_ms(2);
     }
 }

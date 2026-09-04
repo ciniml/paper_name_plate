@@ -5,6 +5,9 @@ runner = "espflash flash --monitor --chip esp32s3"
 
 [env]
 ESP_LOG="info"
+# 1 kHz scheduler tick: the main task sleeps in 1 ms steps (idle = WFI)
+# while the NFC emulator still gets 1 ms polling when a reader is present.
+ESP_RTOS_CONFIG_TICK_RATE_HZ="1000"
 ESPFLASH_PORT="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_B8:1F:3F:D1:BE:60-if00"
 
 [build]

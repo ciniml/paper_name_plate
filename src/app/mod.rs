@@ -5,8 +5,10 @@ pub mod ble;
 pub mod plate;
 pub mod ui;
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use embedded_hal::delay::DelayNs;
-use esp_hal::time::Instant;
+use esp_hal::time::{Duration, Instant};
 use log::{error, info, warn};
 use static_cell::StaticCell;
 
@@ -33,6 +35,25 @@ const ACTIVE_POLL_MS: u32 = 200;
 /// After switching the field on, give phones (card emulation needs to boot)
 /// this long before the first WUPA. Physical tags would need ~5 ms.
 const FIELD_SETTLE_MS: u32 = 80;
+/// Main-loop sleep while nothing is going on (no reader, no BLE central).
+const IDLE_TICK_MS: u32 = 5;
+/// Even with the IRQ line quiet, poll the NFC chip this often as a safety
+/// net (field detection while the emulator is `Off` reads a register).
+const NFC_SAFETY_POLL_MS: u64 = 250;
+/// Heartbeat log period.
+const HEARTBEAT_MS: u64 = 10_000;
+
+/// Microseconds the main task has spent sleeping (wraps; use deltas).
+static IDLE_US: AtomicU32 = AtomicU32::new(0);
+
+/// Sleep the main task. The scheduler's idle hook executes WFI, so this is
+/// where the CPU actually rests; every busy `delay_ms` in the main loop
+/// was replaced by this. Accounts the time for the heartbeat's idle ratio.
+pub(crate) fn idle_sleep_ms(ms: u32) {
+    let t0 = Instant::now();
+    esp_rtos::CurrentThreadHandle::get().delay(Duration::from_millis(ms as u64));
+    IDLE_US.fetch_add(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
+}
 
 static FRAMEBUFFER: StaticCell<FrameBuffer> = StaticCell::new();
 /// Copy of what is currently on the panel (baseline for differential updates).
@@ -67,6 +88,10 @@ pub struct App {
     /// Last time the emulator saw any field activity (for the re-init watchdog).
     emu_last_field: Instant,
     content: PlateContent,
+    /// Last time the NFC chip was polled despite a quiet IRQ line.
+    nfc_last_poll: Instant,
+    hb_last: Instant,
+    hb_idle_us: u32,
     /// A display image is stored in the flash image slot. Large images are
     /// not kept in `content.image` between redraws (see [`Self::draw_plate`]).
     image_in_flash: bool,
@@ -103,6 +128,9 @@ impl App {
             emu_running: false,
             emu_last_field: Instant::now(),
             content: PlateContent::demo(),
+            nfc_last_poll: Instant::now(),
+            hb_last: Instant::now(),
+            hb_idle_us: 0,
             image_in_flash: false,
         }
     }
@@ -199,14 +227,27 @@ impl App {
     fn tick(&mut self, allow_emulation: bool, emu_ms: u32) {
         if self.emulate {
             if allow_emulation {
-                self.run_emulation_slice(emu_ms);
+                // Talk to the NFC chip only when it signalled something (IRQ
+                // pin high), while a reader is engaged, at start-up, or for a
+                // slow safety poll; otherwise let the CPU sleep.
+                let engaged = self.emu_running && self.emu.state() != crate::t2t_emu::State::Off;
+                let want = !self.emu_running
+                    || engaged
+                    || self.board.nfc_irq.is_high()
+                    || self.nfc_last_poll.elapsed().as_millis() > NFC_SAFETY_POLL_MS;
+                if want {
+                    self.nfc_last_poll = Instant::now();
+                    self.run_emulation_slice(emu_ms);
+                } else {
+                    idle_sleep_ms(IDLE_TICK_MS);
+                }
             } else {
-                self.board.delay.delay_ms(1);
+                idle_sleep_ms(1);
             }
             self.polls += 1;
         } else {
             let ms = if self.last_tag.is_some() { ACTIVE_POLL_MS } else { IDLE_POLL_MS };
-            self.board.delay.delay_ms(ms);
+            idle_sleep_ms(ms);
             self.polls += 1;
             self.poll_nfc();
         }
@@ -225,20 +266,38 @@ impl App {
             }
         }
         self.manage_epd_sleep();
+        self.heartbeat();
+    }
 
-        if self.polls.is_multiple_of(300)
-            && let Some(nfc) = self.board.nfc.as_mut()
-        {
-            let (opc, aux) = nfc.status().map(|(o, a, _)| (o, a)).unwrap_or((0, 0));
-            info!(
-                "heartbeat: up={}s polls={} tags={} epd_sleep={} emu={:?} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
-                self.boot.elapsed().as_secs(),
-                self.polls,
-                self.tag_count,
-                self.epd_sleeping,
-                self.emu.state()
-            );
+    /// Periodic status line, including the share of time the CPU spent
+    /// sleeping since the previous line (power-saving proxy: there is no
+    /// current meter on the bench).
+    fn heartbeat(&mut self) {
+        let elapsed = self.hb_last.elapsed();
+        if elapsed.as_millis() < HEARTBEAT_MS {
+            return;
         }
+        self.hb_last = Instant::now();
+        let idle_now = IDLE_US.load(Ordering::Relaxed);
+        let idle_us = idle_now.wrapping_sub(self.hb_idle_us);
+        self.hb_idle_us = idle_now;
+        let idle_pct = (idle_us as u64 * 100 / elapsed.as_micros().max(1)) as u32;
+        let (opc, aux) = self
+            .board
+            .nfc
+            .as_mut()
+            .and_then(|nfc| nfc.status().ok())
+            .map(|(o, a, _)| (o, a))
+            .unwrap_or((0, 0));
+        info!(
+            "heartbeat: up={}s idle={idle_pct}% polls={} tags={} epd_sleep={} emu={:?} nfc_irq={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
+            self.boot.elapsed().as_secs(),
+            self.polls,
+            self.tag_count,
+            self.epd_sleeping,
+            self.emu.state(),
+            self.board.nfc_irq.is_high() as u8,
+        );
     }
 
     /// A complete image arrived over BLE: persist, adopt and redraw.
@@ -270,6 +329,11 @@ impl App {
 
     /// A tap toggles the front light and counts as activity.
     fn handle_touch(&mut self) {
+        // INT is low while a finger is down; skip the I2C read otherwise
+        // (but keep reading until the release is seen).
+        if !self.touch_down && self.board.tp_int.is_high() {
+            return;
+        }
         let b = &mut self.board;
         let Some(touch) = b.touch.as_mut() else { return };
         let mut pts = [TouchPoint::default(); 2];
@@ -324,7 +388,7 @@ impl App {
     fn run_emulation_slice(&mut self, ms: u32) {
         let b = &mut self.board;
         let Some(nfc) = b.nfc.as_mut() else {
-            b.delay.delay_ms(ms);
+            idle_sleep_ms(ms);
             return;
         };
         if !self.emu_running {
@@ -336,7 +400,7 @@ impl App {
                 }
                 Err(e) => {
                     error!("T2T emulation start failed: {e:?}");
-                    b.delay.delay_ms(1000);
+                    idle_sleep_ms(1000);
                     return;
                 }
             }
@@ -352,7 +416,7 @@ impl App {
         let t0 = Instant::now();
         while t0.elapsed().as_millis() < ms as u64 {
             match self.emu.update(nfc, &mut b.delay) {
-                Ok(EmuEvent::None) => b.delay.delay_ms(1),
+                Ok(EmuEvent::None) => idle_sleep_ms(1),
                 Ok(EmuEvent::FieldOn) => {
                     self.emu_last_field = Instant::now();
                     info!("T2T: field on (up={}s)", self.boot.elapsed().as_secs());

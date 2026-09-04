@@ -106,6 +106,9 @@ pub struct Board {
     pub nfc: Option<St25r3916<BusDevice>>,
     /// Touch INT (GPIO4, low while touched in polling mode).
     pub tp_int: Input<'static>,
+    /// ST25R3916 IRQ (GPIO6, high while an unmasked interrupt is pending).
+    /// Lets the app skip I2C polling of the NFC chip when nothing happened.
+    pub nfc_irq: Input<'static>,
     pub button_a: Input<'static>,
     pub button_b: Input<'static>,
     pub flash: FlashStorage<'static>,
@@ -182,6 +185,7 @@ impl Board {
 
         // ---- Touch (needs its own reset: ~300 ms boot time) ----
         let tp_int = Input::new(p.GPIO4, InputConfig::default().with_pull(Pull::Up));
+        let nfc_irq = Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::Down));
         if let Err(e) = touch_reset(&mut ioe, &mut delay) {
             error!("touch reset failed: {e:?}");
         }
@@ -237,7 +241,7 @@ impl Board {
         let flash = FlashStorage::new(p.FLASH);
         let bt = Some(p.BT);
 
-        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, button_a, button_b, flash, bt }
+        Board { delay, pm1, ioe, epd, touch, nfc, tp_int, nfc_irq, button_a, button_b, flash, bt }
     }
 }
 
@@ -264,14 +268,15 @@ fn recover_i2c_speed(bus: &Bus, delay: &mut Delay) {
 
 /// Bring up the e-paper and touch power/reset lines through the IOE1 and
 /// perform the hardware reset sequence used by M5GFX:
-/// EPD_EN/TP_EN/TF_EN high, then EPD_RST & TP_RST low 8 ms → high 2 ms.
+/// EPD_EN/TP_EN high (TF_EN stays low: the SD slot is unused and its rail
+/// only costs current), then EPD_RST & TP_RST low 8 ms → high 2 ms.
 pub fn epd_power_on<I: I2c>(ioe: &mut Ioe1<I>, delay: &mut impl DelayNs) -> Result<(), I::Error> {
     for p in [ioe::EPD_EN, ioe::EPD_RST, ioe::TP_RST, ioe::TP_EN, ioe::TF_EN] {
         ioe.set_output(p)?;
     }
     ioe.write(ioe::EPD_EN, true)?;
     ioe.write(ioe::TP_EN, true)?;
-    ioe.write(ioe::TF_EN, true)?;
+    ioe.write(ioe::TF_EN, false)?;
     delay.delay_ms(2);
     epd_hard_reset(ioe, delay)
 }
