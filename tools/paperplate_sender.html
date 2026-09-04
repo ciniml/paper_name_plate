@@ -69,7 +69,9 @@
     border: 6px solid #2b2b28;
     border-radius: 4px;
     background: #fff;
-    image-rendering: pixelated;
+    /* Dithered 1-bit images must be shown 1:1 or smoothly downscaled;
+       nearest-neighbour scaling drops every other dot and looks broken. */
+    image-rendering: auto;
     max-width: 100%;
     height: auto;
   }
@@ -117,7 +119,7 @@
     </div>
     <label>しきい値 <input type="range" id="thresh" min="16" max="240" value="128"></label>
     <div class="preview-wrap"><canvas id="preview" width="480" height="800"></canvas></div>
-    <p class="hint">プレビューが実際の表示（黒 = インク）です。</p>
+    <p class="hint">プレビューが実際の表示（黒 = インク）です。画面が狭いと縮小表示されるため、細部は実機で確認してください。</p>
   </section>
 
   <section>
@@ -172,7 +174,8 @@ function render() {
   const { w, h } = targetSize();
   canvas.width = w;
   canvas.height = h;
-  canvas.style.width = (w >= 400 ? "240px" : w / 2 + "px");
+  // Show 1:1 when it fits; otherwise let the browser downscale smoothly.
+  canvas.style.width = w + "px";
 
   // Cover-fit the source into the target.
   const scale = Math.max(w / srcImage.width, h / srcImage.height);
