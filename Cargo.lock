@@ -1327,6 +1327,7 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "esp-storage",
+ "esp32s3",
  "log",
  "static_cell",
  "u8g2-fonts",

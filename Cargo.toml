@@ -34,6 +34,7 @@ esp-radio = { version = "0.18.0", features = ["ble", "esp-alloc", "esp32s3", "un
 esp-rtos = { version = "0.3.0", features = ["esp-alloc", "esp-radio", "esp32s3"] }
 bleps = { git = "https://github.com/bjoernQ/bleps", rev = "a5148d8ae679e021b78f53fd33afb8bb35d0b62e", features = ["macros", "mtu128"] }
 embedded-storage   = "0.3"
+esp32s3 = "0.35" # raw USB-JTAG frame counter (host-attached check)
 embedded-io-06     = { package = "embedded-io", version = "0.6" }
 
 

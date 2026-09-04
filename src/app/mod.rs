@@ -8,6 +8,7 @@ pub mod ui;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use embedded_hal::delay::DelayNs;
+use esp_hal::rtc_cntl::sleep::{GpioWakeupSource, RtcSleepConfig, TimerWakeupSource};
 use esp_hal::time::{Duration, Instant};
 use log::{error, info, warn};
 use static_cell::StaticCell;
@@ -42,6 +43,14 @@ const IDLE_TICK_MS: u32 = 5;
 const NFC_SAFETY_POLL_MS: u64 = 250;
 /// Heartbeat log period.
 const HEARTBEAT_MS: u64 = 10_000;
+/// Doze (light sleep, BLE off) after this long without any activity
+/// (touch, button, NFC field, BLE traffic).
+pub(crate) const DOZE_AFTER_MS: u64 = 120_000;
+/// Never doze this soon after boot (keeps the USB console alive for
+/// development; light sleep drops the USB-JTAG link).
+const DOZE_MIN_UPTIME_MS: u64 = 60_000;
+/// Light-sleep chunk while dozing; GPIO wake sources cut it short.
+const DOZE_SLEEP_MS: u32 = 250;
 
 /// Microseconds the main task has spent sleeping (wraps; use deltas).
 static IDLE_US: AtomicU32 = AtomicU32::new(0);
@@ -53,6 +62,50 @@ pub(crate) fn idle_sleep_ms(ms: u32) {
     let t0 = Instant::now();
     esp_rtos::CurrentThreadHandle::get().delay(Duration::from_millis(ms as u64));
     IDLE_US.fetch_add(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
+}
+
+/// Doze diagnostics that survive a reset (light sleep drops the USB console,
+/// so a crash inside doze would otherwise be invisible). Printed at boot.
+/// `[magic, stage, light_sleeps, last_sleep_rtc_ms, adv_off_result, total_doze_rtc_ms]`
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut DOZE_DIAG: [u32; 8] = [0; 8];
+const DOZE_MAGIC: u32 = 0xD02E_0001;
+
+pub(crate) fn doze_diag_set(idx: usize, v: u32) {
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(DOZE_DIAG);
+        d[0] = DOZE_MAGIC;
+        d[idx] = v;
+    }
+}
+
+/// Is a USB host talking to the USB-JTAG console? The host sends a SOF
+/// every 1 ms, which advances the frame counter; a bare charger does not.
+/// Light sleep kills the USB link, so we never doze while a host is
+/// attached (keeps the development console and `espflash` usable).
+fn usb_host_active() -> bool {
+    let regs = unsafe { &*esp32s3::USB_DEVICE::ptr() };
+    let a = regs.fram_num().read().sof_frame_index().bits();
+    idle_sleep_ms(4);
+    let b = regs.fram_num().read().sof_frame_index().bits();
+    a != b
+}
+
+/// Print and clear the doze diagnostics left by the previous run.
+fn doze_diag_report() {
+    let d = unsafe { *core::ptr::addr_of!(DOZE_DIAG) };
+    let reason = esp_hal::rtc_cntl::reset_reason(esp_hal::system::Cpu::ProCpu);
+    let cause = esp_hal::rtc_cntl::wakeup_cause();
+    info!("boot: reset_reason={reason:?} wakeup_cause={cause:?}");
+    if d[0] == DOZE_MAGIC {
+        warn!(
+            "boot: previous run ended in doze: stage={} light_sleeps={} last_sleep={}ms adv_off={} doze_total={}ms",
+            d[1], d[2], d[3], d[4], d[5]
+        );
+    }
+    unsafe {
+        (*core::ptr::addr_of_mut!(DOZE_DIAG)) = [0; 8];
+    }
 }
 
 static FRAMEBUFFER: StaticCell<FrameBuffer> = StaticCell::new();
@@ -92,6 +145,12 @@ pub struct App {
     nfc_last_poll: Instant,
     hb_last: Instant,
     hb_idle_us: u32,
+    /// Doze mode: BLE off, light sleep between NFC/touch/button checks.
+    dozing: bool,
+    /// Poll the NFC chip on the next tick regardless of the IRQ line
+    /// (set after each light sleep, whose wake reason we do not decode).
+    force_nfc_poll: bool,
+    light_sleeps: u32,
     /// A display image is stored in the flash image slot. Large images are
     /// not kept in `content.image` between redraws (see [`Self::draw_plate`]).
     image_in_flash: bool,
@@ -131,6 +190,9 @@ impl App {
             nfc_last_poll: Instant::now(),
             hb_last: Instant::now(),
             hb_idle_us: 0,
+            dozing: false,
+            force_nfc_poll: false,
+            light_sleeps: 0,
             image_in_flash: false,
         }
     }
@@ -159,6 +221,7 @@ impl App {
     }
 
     pub fn run(mut self) -> ! {
+        doze_diag_report();
         let b = &mut self.board;
 
         // Restore persisted content, if any.
@@ -212,7 +275,10 @@ impl App {
                 let hci = bleps::HciConnector::new(ble::BufferedHci::new(c), ble::millis);
                 info!("BLE ready (device name: {})", ble::DEVICE_NAME);
                 loop {
-                    self.ble_session(&hci);
+                    match self.ble_session(&hci) {
+                        ble::SessionEnd::Restart => {}
+                        ble::SessionEnd::Doze => self.doze_session(),
+                    }
                 }
             }
             None => loop {
@@ -233,11 +299,15 @@ impl App {
                 let engaged = self.emu_running && self.emu.state() != crate::t2t_emu::State::Off;
                 let want = !self.emu_running
                     || engaged
+                    || self.force_nfc_poll
                     || self.board.nfc_irq.is_high()
                     || self.nfc_last_poll.elapsed().as_millis() > NFC_SAFETY_POLL_MS;
                 if want {
                     self.nfc_last_poll = Instant::now();
+                    self.force_nfc_poll = false;
                     self.run_emulation_slice(emu_ms);
+                } else if self.dozing {
+                    self.light_sleep(DOZE_SLEEP_MS);
                 } else {
                     idle_sleep_ms(IDLE_TICK_MS);
                 }
@@ -269,6 +339,55 @@ impl App {
         self.heartbeat();
     }
 
+    /// Everything quiet for long enough (and not too soon after boot)?
+    pub(crate) fn should_doze(&self) -> bool {
+        self.emulate
+            && !self.touch_down
+            && self.emu.state() == crate::t2t_emu::State::Off
+            && self.boot.elapsed().as_millis() > DOZE_MIN_UPTIME_MS
+            && self.last_activity.elapsed().as_millis() > DOZE_AFTER_MS
+            && !usb_host_active()
+    }
+
+    /// Doze until something happens: NFC keeps working (the ST25R3916's
+    /// IRQ wakes the CPU), touch/buttons wake too. Any activity ends the
+    /// doze and the caller restarts BLE.
+    fn doze_session(&mut self) {
+        info!("doze: entering light sleep mode (BLE off)");
+        self.dozing = true;
+        let sleeps0 = self.light_sleeps;
+        let t0 = self.board.rtc.time_since_power_up();
+        doze_diag_set(1, 1);
+        while self.should_doze() {
+            self.tick(true, 6);
+            doze_diag_set(5, (self.board.rtc.time_since_power_up() - t0).as_millis() as u32);
+        }
+        self.dozing = false;
+        doze_diag_set(1, 9);
+        info!(
+            "doze: woke up after {} light sleeps ({} s); BLE back on",
+            self.light_sleeps - sleeps0,
+            (self.board.rtc.time_since_power_up() - t0).as_secs()
+        );
+    }
+
+    /// One light-sleep chunk. Wake on the RTC timer or any enabled GPIO
+    /// (see `Board::init`). `Instant` (SYSTIMER) does not advance while
+    /// asleep, so elapsed-time logic only counts awake time in doze.
+    fn light_sleep(&mut self, ms: u32) {
+        let timer = TimerWakeupSource::new(core::time::Duration::from_millis(ms as u64));
+        let gpio = GpioWakeupSource::new();
+        let cfg = RtcSleepConfig::default();
+        let t0 = self.board.rtc.time_since_power_up();
+        doze_diag_set(1, 2);
+        self.board.rtc.sleep(&cfg, &[&timer, &gpio]);
+        doze_diag_set(1, 3);
+        self.light_sleeps += 1;
+        doze_diag_set(2, self.light_sleeps);
+        doze_diag_set(3, (self.board.rtc.time_since_power_up() - t0).as_millis() as u32);
+        self.force_nfc_poll = true;
+    }
+
     /// Periodic status line, including the share of time the CPU spent
     /// sleeping since the previous line (power-saving proxy: there is no
     /// current meter on the bench).
@@ -290,8 +409,10 @@ impl App {
             .map(|(o, a, _)| (o, a))
             .unwrap_or((0, 0));
         info!(
-            "heartbeat: up={}s idle={idle_pct}% polls={} tags={} epd_sleep={} emu={:?} nfc_irq={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
+            "heartbeat: up={}s rtc_up={}s idle={idle_pct}% lsleeps={} polls={} tags={} epd_sleep={} emu={:?} nfc_irq={} op_ctrl=0x{opc:02X} aux=0x{aux:02X}",
             self.boot.elapsed().as_secs(),
+            self.board.rtc.time_since_power_up().as_secs(),
+            self.light_sleeps,
             self.polls,
             self.tag_count,
             self.epd_sleeping,
@@ -357,6 +478,9 @@ impl App {
     /// handling the device.
     fn handle_buttons(&mut self) {
         let down = self.board.button_a.is_low();
+        if down || self.board.button_b.is_low() {
+            self.last_activity = Instant::now();
+        }
         if down && !self.btn_a_down {
             self.btn_a_since = Instant::now();
             self.btn_a_armed = true;
@@ -419,6 +543,7 @@ impl App {
                 Ok(EmuEvent::None) => idle_sleep_ms(1),
                 Ok(EmuEvent::FieldOn) => {
                     self.emu_last_field = Instant::now();
+                    self.last_activity = Instant::now();
                     info!("T2T: field on (up={}s)", self.boot.elapsed().as_secs());
                 }
                 Ok(EmuEvent::Selected) => {

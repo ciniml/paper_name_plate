@@ -378,15 +378,24 @@ impl ImgRx {
     }
 }
 
+/// Why a BLE session ended.
+pub(crate) enum SessionEnd {
+    /// Disconnect or stack error: start a new session right away.
+    Restart,
+    /// Nothing happened for a long time: advertising is off, the caller
+    /// should doze (light sleep) until something wakes the plate.
+    Doze,
+}
+
 impl super::App {
     /// One BLE session: advertise, serve GATT until disconnect (or error),
     /// running the normal app tick in between. Returns to be called again.
-    pub(crate) fn ble_session(&mut self, hci: &HciConnector<BufferedHci>) {
+    pub(crate) fn ble_session(&mut self, hci: &HciConnector<BufferedHci>) -> SessionEnd {
         let mut ble = Ble::new(hci);
         if let Err(e) = ble.init() {
             error!("BLE stack init failed: {e:?}");
             self.board.delay.delay_ms(1000);
-            return;
+            return SessionEnd::Restart;
         }
         // 200-250 ms advertising interval (bleps' default is 160 ms): still
         // found within a second by phones, noticeably less radio time.
@@ -416,7 +425,7 @@ impl super::App {
             }
             Err(e) => {
                 error!("BLE adv data failed: {e:?}");
-                return;
+                return SessionEnd::Restart;
             }
         }
         let _ = ble.cmd_set_le_advertise_enable(true);
@@ -480,7 +489,10 @@ impl super::App {
         let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut rng);
 
         let mut errors = 0u32;
-        loop {
+        // Last time the controller handed us anything (connection traffic
+        // counts as activity even without GATT operations).
+        let mut hci_last_ms = millis();
+        let end = 'session: loop {
             // Pump HCI while the controller has something for us (or we have
             // a notification to send). Advertising runs in the controller on
             // its own, so with nothing queued there is nothing to do and the
@@ -493,17 +505,18 @@ impl super::App {
                 if ntf.is_none() && !esp_radio::ble::have_hci_read_data() {
                     break;
                 }
+                hci_last_ms = millis();
                 match srv.do_work_with_notification(ntf) {
                     Ok(WorkResult::GotDisconnected) => {
                         info!("BLE: disconnected");
-                        return;
+                        break 'session SessionEnd::Restart;
                     }
                     Ok(WorkResult::DidWork) => {}
                     Err(e) => {
                         errors += 1;
                         if errors >= 8 {
                             warn!("BLE: {errors} work errors ({e:?}); restarting session");
-                            return;
+                            break 'session SessionEnd::Restart;
                         }
                         break;
                     }
@@ -539,11 +552,34 @@ impl super::App {
             if ble_active {
                 self.tick_light();
             } else {
+                if millis().saturating_sub(hci_last_ms) > super::DOZE_AFTER_MS && self.should_doze() {
+                    break 'session SessionEnd::Doze;
+                }
                 // Keep the BLE service cadence tight so advertising stays
                 // continuous (discoverable) while NFC emulation still runs.
                 self.tick(true, 6);
             }
+        };
+
+        if matches!(end, SessionEnd::Doze) {
+            // The link layer runs on this CPU: it cannot advertise while we
+            // light-sleep, so stop it cleanly. The next session re-inits the
+            // stack and starts advertising again.
+            // `srv` holds `ble` for its whole lifetime; a fresh handle on
+            // the same HCI link is enough to send one command.
+            let mut ble = Ble::new(hci);
+            match ble.cmd_set_le_advertise_enable(false) {
+                Ok(_) => {
+                    super::doze_diag_set(4, 1);
+                    info!("BLE: advertising off (doze)");
+                }
+                Err(e) => {
+                    super::doze_diag_set(4, 2);
+                    warn!("BLE: advertising off failed: {e:?}");
+                }
+            }
         }
+        end
     }
 
     /// Cheap housekeeping used while a BLE central is active: touch,
