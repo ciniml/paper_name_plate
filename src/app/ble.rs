@@ -3,6 +3,8 @@
 //! Protocol v2 (all little endian). Windowed, acknowledged transfer:
 //!
 //! * CTRL characteristic (write / write-without-response):
+//!   * `11 len:u32 crc32:u32 ack_every:u8` — start a plate-text transfer
+//!     (UTF-8 `name\ntitle\norg\nnote\nurl`, applied on commit).
 //!   * `10 w:u16 h:u16 len:u32 crc32:u32 ack_every:u8` — start a transfer
 //!     (`len` = row_bytes*h, `crc32` = IEEE CRC-32 of the payload,
 //!     `ack_every` = number of accepted DATA packets per acknowledgement,
@@ -14,6 +16,7 @@
 //!   Packets must arrive in order (`off` == bytes received so far); an
 //!   out-of-order packet is dropped and answered with a STATUS notification
 //!   (NAK) carrying the offset the device actually expects.
+//! * CONTENT characteristic (read): current plate text in the plain form.
 //! * STATUS characteristic (read / notify): `state:u8 received:u32 expected:u32`
 //!   state: 0 idle, 1 receiving, 2 committed, 3 CRC error, 4 commit with
 //!   missing data. A notification is sent after every `ack_every` accepted
@@ -187,11 +190,15 @@ const UUID_SVC: [u8; 16] = uuid_le(0x01);
 const UUID_CTRL: [u8; 16] = uuid_le(0x02);
 const UUID_DATA: [u8; 16] = uuid_le(0x03);
 const UUID_STATUS: [u8; 16] = uuid_le(0x04);
+const UUID_CONTENT: [u8; 16] = uuid_le(0x05);
 
 // Attribute handles (1-based, in table order).
 const H_CTRL_VAL: u16 = 3;
 const H_DATA_VAL: u16 = 5;
 const H_STATUS_VAL: u16 = 7;
+const H_CONTENT_VAL: u16 = 10;
+/// Plate text payload cap (the NTAG user area is 888 B anyway).
+const MAX_CONTENT_BYTES: usize = 1024;
 
 const PROP_READ: u8 = 0x02;
 const PROP_WRITE_NO_RSP: u8 = 0x04;
@@ -233,9 +240,14 @@ const ST_COMMITTED: u8 = 2;
 const ST_CRC_ERROR: u8 = 3;
 const ST_INCOMPLETE: u8 = 4;
 
+const KIND_IMAGE: u8 = 1;
+const KIND_CONTENT: u8 = 2;
+
 #[derive(Default)]
 pub struct ImgRx {
     state: u8,
+    /// What the current transfer carries (`KIND_*`).
+    kind: u8,
     width: u16,
     height: u16,
     expected: usize,
@@ -243,6 +255,7 @@ pub struct ImgRx {
     ack_every: u8,
     data: Vec<u8>,
     done: Option<MonoImage>,
+    done_content: Option<Vec<u8>>,
     /// millis() of the last GATT interaction (for BLE-priority scheduling).
     last_ms: u64,
     /// Client subscribed to STATUS notifications (CCCD).
@@ -266,6 +279,26 @@ impl ImgRx {
     fn ctrl(&mut self, d: &[u8]) {
         self.last_ms = millis();
         match d.first() {
+            Some(0x11) if d.len() >= 10 => {
+                let len = u32::from_le_bytes([d[1], d[2], d[3], d[4]]) as usize;
+                let crc = u32::from_le_bytes([d[5], d[6], d[7], d[8]]);
+                let ack_every = if d[9] == 0 { DEFAULT_ACK_EVERY } else { d[9] };
+                if len == 0 || len > MAX_CONTENT_BYTES {
+                    warn!("BLE content: bad start len={len}");
+                    self.reset();
+                    self.pending_ntf = true;
+                    return;
+                }
+                info!("BLE content: start ({len} B, ack every {ack_every})");
+                self.reset();
+                self.state = ST_RECEIVING;
+                self.kind = KIND_CONTENT;
+                self.expected = len;
+                self.crc = crc;
+                self.ack_every = ack_every;
+                self.data = Vec::with_capacity(len);
+                self.pending_ntf = true;
+            }
             Some(0x10) if d.len() >= 14 => {
                 let w = u16::from_le_bytes([d[1], d[2]]);
                 let h = u16::from_le_bytes([d[3], d[4]]);
@@ -282,6 +315,7 @@ impl ImgRx {
                 info!("BLE img: start {w}x{h} ({len} B, ack every {ack_every})");
                 self.reset();
                 self.state = ST_RECEIVING;
+                self.kind = KIND_IMAGE;
                 self.width = w;
                 self.height = h;
                 self.expected = len;
@@ -301,6 +335,10 @@ impl ImgRx {
                     warn!("BLE img: CRC mismatch");
                     self.state = ST_CRC_ERROR;
                     self.data = Vec::new();
+                } else if self.kind == KIND_CONTENT {
+                    info!("BLE content: commit ({} B, CRC ok)", self.data.len());
+                    self.state = ST_COMMITTED;
+                    self.done_content = Some(core::mem::take(&mut self.data));
                 } else {
                     info!("BLE img: commit ({} B, CRC ok)", self.data.len());
                     self.state = ST_COMMITTED;
@@ -480,6 +518,21 @@ impl super::App {
             }
         };
         let mut cccd_val = (&mut rf_cccd, &mut wf_cccd, ());
+        // 9/10: CONTENT declaration + value (current plate text, long-read
+        // capable via the offset).
+        let content_text = RefCell::new(self.content.to_plain().into_bytes());
+        let content_decl = char_decl(PROP_READ, H_CONTENT_VAL, UUID_CONTENT);
+        let mut content_decl_val: &[u8; 19] = &content_decl;
+        let mut rf_content = |offset: usize, out: &mut [u8]| -> usize {
+            let t = content_text.borrow();
+            if offset >= t.len() {
+                return 0;
+            }
+            let n = (t.len() - offset).min(out.len());
+            out[..n].copy_from_slice(&t[offset..offset + n]);
+            n
+        };
+        let mut content_val = (&mut rf_content, (), ());
 
         let mut gatt_attributes = [
             Attribute::new(PRIMARY_SERVICE_UUID16, &mut svc_val),
@@ -490,6 +543,8 @@ impl super::App {
             Attribute::new(CHARACTERISTIC_UUID16, &mut status_decl_val),
             Attribute::new(Uuid::Uuid128(UUID_STATUS), &mut status_val),
             Attribute::new(Uuid::Uuid16(0x2902), &mut cccd_val),
+            Attribute::new(CHARACTERISTIC_UUID16, &mut content_decl_val),
+            Attribute::new(Uuid::Uuid128(UUID_CONTENT), &mut content_val),
         ];
 
         let mut rng = NoRng;
@@ -542,6 +597,20 @@ impl super::App {
             };
             if let Some(img) = img {
                 self.on_ble_image(img);
+                rx.borrow_mut().state = ST_IDLE;
+                errors = 0;
+            }
+            let text = {
+                let mut r = rx.borrow_mut();
+                if r.pending_ntf {
+                    None
+                } else {
+                    r.done_content.take()
+                }
+            };
+            if let Some(text) = text {
+                self.on_ble_content(&text);
+                *content_text.borrow_mut() = self.content.to_plain().into_bytes();
                 rx.borrow_mut().state = ST_IDLE;
                 errors = 0;
             }

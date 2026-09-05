@@ -54,6 +54,11 @@ fn is_plain_ascii(s: &str) -> bool {
     s.bytes().all(|b| (0x20..0x7F).contains(&b))
 }
 
+/// Short-record limits: the Text record payload (`lang` + text) and the
+/// URI record payload must each fit a one-byte length.
+pub const MAX_TEXT_PAYLOAD: usize = 240;
+pub const MAX_URL_LEN: usize = 200;
+
 /// MIME type of the plate's image record.
 pub const IMAGE_MIME: &[u8] = b"image/x-plate";
 
@@ -253,6 +258,44 @@ impl PlateContent {
             t.extend_from_slice(part.as_bytes());
         }
         t
+    }
+
+    /// Plain-text form used by the BLE content characteristic:
+    /// `name\ntitle\norg\nnote\nurl` (UTF-8, LF separated).
+    pub fn to_plain(&self) -> String {
+        let mut t = String::new();
+        for (i, part) in [&self.name, &self.title, &self.org, &self.note, &self.url].iter().enumerate() {
+            if i > 0 {
+                t.push('\n');
+            }
+            t.push_str(part);
+        }
+        t
+    }
+
+    /// Update the text fields from the plain-text form (see [`Self::to_plain`]).
+    /// Missing trailing lines clear the corresponding fields; the image is
+    /// left untouched. Rejects (without changing anything) text that would
+    /// not fit the short NDEF records served over NFC.
+    pub fn apply_plain(&mut self, text: &str) -> Result<(), &'static str> {
+        let mut lines = text.split('\n').map(|l| l.trim_end_matches('\r').trim());
+        let name = lines.next().unwrap_or("");
+        let title = lines.next().unwrap_or("");
+        let org = lines.next().unwrap_or("");
+        let note = lines.next().unwrap_or("");
+        let url = lines.next().unwrap_or("").trim_start_matches("https://").trim_start_matches("http://");
+        if name.len() + title.len() + org.len() + note.len() + 3 > MAX_TEXT_PAYLOAD {
+            return Err("text too long");
+        }
+        if url.len() > MAX_URL_LEN {
+            return Err("url too long");
+        }
+        self.name = name.into();
+        self.title = title.into();
+        self.org = org.into();
+        self.note = note.into();
+        self.url = url.into();
+        Ok(())
     }
 
     /// Update the content from an NDEF message (all records scanned).

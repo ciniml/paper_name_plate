@@ -57,13 +57,18 @@
     letter-spacing: 0.08em; color: var(--muted); margin: 0;
   }
   label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  label.field { display: grid; grid-template-columns: 4.5em 1fr; align-items: center; gap: 8px; }
+  input[type="text"], input[type="url"] {
+    font: inherit; font-size: 15px; color: var(--ink); background: var(--card);
+    border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; width: 100%; box-sizing: border-box;
+  }
   input[type="file"] { font-size: 13px; color: var(--ink); }
   select, input[type="range"] { accent-color: var(--accent); }
   select {
     background: var(--card); color: var(--ink);
     border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; font-size: 13px;
   }
-  .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .preview-wrap { display: flex; justify-content: center; }
   #preview {
     border: 6px solid #2b2b28;
@@ -81,6 +86,7 @@
     border: none; border-radius: 6px; padding: 12px 16px;
     cursor: pointer;
   }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
   button:disabled { opacity: 0.45; cursor: default; }
   button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
   .progress {
@@ -100,11 +106,25 @@
 
 <main>
   <h1>PaperPlate Sender
-    <small>モノクロ画像を BLE でネームプレートへ送信</small>
+    <small>BLE でネームプレートの公開内容と画像を設定</small>
   </h1>
 
   <section>
-    <h2>1. 画像</h2>
+    <h2>1. 公開内容（NFC で配布・画面に表示）</h2>
+    <label class="field">名前 <input type="text" id="f-name" maxlength="80" placeholder="山田 太郎"></label>
+    <label class="field">肩書 <input type="text" id="f-title" maxlength="80" placeholder="Embedded Engineer"></label>
+    <label class="field">所属 <input type="text" id="f-org" maxlength="80" placeholder="ACME Corp"></label>
+    <label class="field">メモ <input type="text" id="f-note" maxlength="80" placeholder="Tap your phone to get the link"></label>
+    <label class="field">URL <input type="url" id="f-url" maxlength="200" placeholder="https://example.com/you"></label>
+    <div class="row">
+      <button id="read" class="secondary">プレートから読み込み</button>
+      <button id="write">プレートに書き込み</button>
+    </div>
+    <p class="hint">スマホをかざすと URL が開きます。名前など 4 項目は合計 240 バイトまで（日本語は 1 文字 3 バイト）。</p>
+  </section>
+
+  <section>
+    <h2>2. 画像</h2>
     <label>ファイル <input type="file" id="file" accept="image/*"></label>
     <div class="row">
       <label>サイズ
@@ -120,38 +140,40 @@
     <label>しきい値 <input type="range" id="thresh" min="16" max="240" value="128"></label>
     <div class="preview-wrap"><canvas id="preview" width="480" height="800"></canvas></div>
     <p class="hint">プレビューが実際の表示（黒 = インク）です。画面が狭いと縮小表示されるため、細部は実機で確認してください。</p>
+    <button id="send" disabled>画像を送信</button>
   </section>
 
   <section>
-    <h2>2. 送信</h2>
-    <button id="send" disabled>接続して送信</button>
+    <h2>3. 状態</h2>
     <div class="progress"><div id="bar"></div></div>
-    <pre id="log">画像を選ぶと送信できます。Android の Chrome で開いてください。</pre>
+    <pre id="log">Android の Chrome で開いてください。ボタンを押すとデバイス選択が出ます。</pre>
   </section>
 </main>
 
 <script>
 "use strict";
-const SVC  = "50415045-5250-4c41-5445-000000000001";
-const CTRL = "50415045-5250-4c41-5445-000000000002";
-const DATA = "50415045-5250-4c41-5445-000000000003";
-const STAT = "50415045-5250-4c41-5445-000000000004";
+const SVC     = "50415045-5250-4c41-5445-000000000001";
+const CTRL    = "50415045-5250-4c41-5445-000000000002";
+const DATA    = "50415045-5250-4c41-5445-000000000003";
+const STAT    = "50415045-5250-4c41-5445-000000000004";
+const CONTENT = "50415045-5250-4c41-5445-000000000005";
 
 // Protocol v2 (see src/app/ble.rs): windowed transfer with acknowledgements.
 const ACK_EVERY = 16;     // packets per acknowledgement window
 const CHUNK_BIG = 123;    // data bytes per packet at MTU 128 (125 - 2 header)
 const CHUNK_SMALL = 18;   // data bytes per packet at MTU 23  (20 - 2 header)
+const MAX_TEXT = 240;     // name+title+org+note (+3 separators) limit on the device
+const MAX_URL = 200;
 
-const fileEl = document.getElementById("file");
-const sizeEl = document.getElementById("size");
-const ditherEl = document.getElementById("dither");
-const invertEl = document.getElementById("invert");
-const threshEl = document.getElementById("thresh");
-const canvas = document.getElementById("preview");
+const $ = id => document.getElementById(id);
+const fields = { name: $("f-name"), title: $("f-title"), org: $("f-org"), note: $("f-note"), url: $("f-url") };
+const fileEl = $("file"), sizeEl = $("size"), ditherEl = $("dither"), invertEl = $("invert"), threshEl = $("thresh");
+const canvas = $("preview");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
-const sendBtn = document.getElementById("send");
-const bar = document.getElementById("bar");
-const logEl = document.getElementById("log");
+const sendBtn = $("send"), readBtn = $("read"), writeBtn = $("write");
+const bar = $("bar");
+const logEl = $("log");
+const buttons = [sendBtn, readBtn, writeBtn];
 
 let srcImage = null;
 let packed = null; // { w, h, bytes: Uint8Array }
@@ -164,6 +186,7 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// ---------------------------------------------------------------- image
 function targetSize() {
   const [w, h] = sizeEl.value.split("x").map(Number);
   return { w, h };
@@ -237,6 +260,7 @@ for (const el of [sizeEl, ditherEl, invertEl, threshEl]) {
   el.addEventListener("input", render);
 }
 
+// ------------------------------------------------------------------ crc
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -252,147 +276,231 @@ function crc32(bytes) {
   return (c ^ 0xFFFFFFFF) >>> 0;
 }
 
+// ------------------------------------------------------------- BLE core
 const STATE_NAMES = { 0: "idle", 1: "receiving", 2: "committed", 3: "CRC error", 4: "incomplete" };
 function parseStatus(v) {
   return { state: v.getUint8(0), received: v.getUint32(1, true), expected: v.getUint32(5, true) };
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function send() {
-  if (!packed) return;
+/// Connect to the plate and return a session object with the
+/// characteristics plus helpers for the acknowledged transfer protocol.
+async function connect() {
   if (!navigator.bluetooth) {
-    log("このブラウザは Web Bluetooth に対応していません。Android の Chrome を使ってください。", "err");
-    return;
+    throw new Error("このブラウザは Web Bluetooth に対応していません。Android の Chrome を使ってください。");
   }
-  sendBtn.disabled = true;
-  bar.style.width = "0%";
-  let gatt = null;
+  log("デバイスを選択してください…");
+  const device = await navigator.bluetooth.requestDevice({
+    filters: [{ name: "PaperPlate" }],
+    optionalServices: [SVC],
+  });
+  log("接続中…");
+  const gatt = await device.gatt.connect();
+  const svc = await gatt.getPrimaryService(SVC);
+  const s = {
+    gatt,
+    ctrl: await svc.getCharacteristic(CTRL),
+    data: await svc.getCharacteristic(DATA),
+    stat: await svc.getCharacteristic(STAT),
+    content: await svc.getCharacteristic(CONTENT),
+    notifyOk: true,
+  };
+  const queue = [];
+  let waiter = null;
+  s.stat.addEventListener("characteristicvaluechanged", ev => {
+    const st = parseStatus(ev.target.value);
+    if (waiter) { const w = waiter; waiter = null; w(st); } else queue.push(st);
+  });
   try {
-    log("デバイスを選択してください…");
-    const device = await navigator.bluetooth.requestDevice({
-      filters: [{ name: "PaperPlate" }],
-      optionalServices: [SVC],
+    await s.stat.startNotifications();
+  } catch (e) {
+    s.notifyOk = false;
+    log("通知が使えないため、読み出しで進捗を確認します。");
+  }
+  function waitStatus(ms) {
+    return new Promise(res => {
+      if (queue.length) return res(queue.shift());
+      const h = st => { clearTimeout(t); res(st); };
+      const t = setTimeout(() => { if (waiter === h) { waiter = null; res(null); } }, ms);
+      waiter = h;
     });
-    log("接続中…");
-    gatt = await device.gatt.connect();
-    const svc = await gatt.getPrimaryService(SVC);
-    const ctrl = await svc.getCharacteristic(CTRL);
-    const data = await svc.getCharacteristic(DATA);
-    const stat = await svc.getCharacteristic(STAT);
+  }
+  s.waitFor = async (pred, ms) => {
+    if (!s.notifyOk) return null;
+    const end = performance.now() + ms;
+    while (performance.now() < end) {
+      const st = await waitStatus(end - performance.now());
+      if (!st) return null;
+      if (pred(st)) return st;
+    }
+    return null;
+  };
+  s.readStatus = async () => {
+    try { return parseStatus(await s.stat.readValue()); } catch (e) { return null; }
+  };
+  s.syncStatus = async () => {
+    let st = null;
+    if (s.notifyOk) {
+      try {
+        await s.ctrl.writeValueWithResponse(Uint8Array.of(0x04));
+        st = await s.waitFor(() => true, 1000);
+      } catch (e) { /* fall through to read */ }
+    }
+    return st || await s.readStatus();
+  };
+  s.close = () => { try { if (gatt.connected) gatt.disconnect(); } catch (e) { /* ignore */ } };
+  return s;
+}
 
-    // --- STATUS notifications (acknowledgements) ----------------------
-    const queue = [];
-    let waiter = null;
-    stat.addEventListener("characteristicvaluechanged", ev => {
-      const st = parseStatus(ev.target.value);
-      if (waiter) { const w = waiter; waiter = null; w(st); } else queue.push(st);
-    });
-    let notifyOk = true;
-    try {
-      await stat.startNotifications();
-    } catch (e) {
-      notifyOk = false;
-      log("通知が使えないため、読み出しで進捗を確認します。");
-    }
-    function waitStatus(ms) {
-      return new Promise(res => {
-        if (queue.length) return res(queue.shift());
-        const h = st => { clearTimeout(t); res(st); };
-        const t = setTimeout(() => { if (waiter === h) { waiter = null; res(null); } }, ms);
-        waiter = h;
-      });
-    }
-    async function waitFor(pred, ms) {
-      const end = performance.now() + ms;
-      while (performance.now() < end) {
-        const st = await waitStatus(end - performance.now());
-        if (!st) return null;
-        if (pred(st)) return st;
-      }
-      return null;
-    }
-    async function readStatus() {
-      try { return parseStatus(await stat.readValue()); } catch (e) { return null; }
-    }
-    // Ask the device where it is: notification if possible, else a read.
-    async function syncStatus() {
-      let st = null;
-      if (notifyOk) {
-        try {
-          await ctrl.writeValueWithResponse(Uint8Array.of(0x04));
-          st = await waitFor(() => true, 1000);
-        } catch (e) { /* fall through to read */ }
-      }
-      return st || await readStatus();
-    }
+/// Acknowledged, windowed transfer of `bytes` after the given START packet;
+/// commits at the end and resolves with the final device state.
+async function transfer(s, start, bytes) {
+  await s.ctrl.writeValueWithResponse(start);
+  let st = await s.waitFor(x => x.state === 1, 2000);
+  if (!st) st = await s.readStatus();
+  if (!st || st.state !== 1) throw new Error("デバイスが転送を開始しませんでした");
 
-    // --- start ----------------------------------------------------------
-    const { w, h, bytes } = packed;
-    const crc = crc32(bytes);
-    const start = new Uint8Array(14);
-    const dv = new DataView(start.buffer);
-    start[0] = 0x10;
+  let chunk = CHUNK_BIG;
+  let off = 0;
+  let rewinds = 0;
+  const t0 = performance.now();
+  while (off < bytes.length) {
+    const burstStart = off;
+    for (let i = 0; i < ACK_EVERY && off < bytes.length; i++) {
+      const part = bytes.subarray(off, Math.min(off + chunk, bytes.length));
+      const pkt = new Uint8Array(2 + part.length);
+      pkt[0] = off & 0xFF;
+      pkt[1] = (off >> 8) & 0xFF;
+      pkt.set(part, 2);
+      try {
+        await s.data.writeValueWithoutResponse(pkt);
+      } catch (e) {
+        if (chunk > CHUNK_SMALL) {
+          chunk = CHUNK_SMALL; // the link's MTU is smaller than expected
+          log("小さいパケットに切り替えます。");
+          break;
+        }
+        throw e;
+      }
+      off += part.length;
+    }
+    const burstEnd = off;
+    st = await s.waitFor(x => x.received >= burstEnd, 1500);
+    if (!st || st.received < burstEnd) {
+      st = await s.syncStatus();
+      if (!st) throw new Error("デバイスから応答がありません");
+      if (st.state !== 1) throw new Error("デバイスが転送を中断しました (" + (STATE_NAMES[st.state] || st.state) + ")");
+      if (st.received < burstEnd) {
+        rewinds++;
+        if (st.received === burstStart && chunk > CHUNK_SMALL) {
+          chunk = CHUNK_SMALL;
+          log("小さいパケットに切り替えます。");
+        }
+        off = st.received;
+      }
+    }
+    bar.style.width = (off / bytes.length * 100).toFixed(1) + "%";
+  }
+  const dt = ((performance.now() - t0) / 1000).toFixed(1);
+  log(`送信完了 ${bytes.length} B (${dt} 秒${rewinds ? `, 再送 ${rewinds} 回` : ""})`);
+
+  // Commit: the device verifies the CRC and answers before refreshing.
+  await s.ctrl.writeValueWithoutResponse(Uint8Array.of(0x02));
+  st = await s.waitFor(x => x.state !== 1, 3000);
+  if (!st) { await sleep(300); st = await s.readStatus(); }
+  return st;
+}
+
+function startPacket(kind, bytes, w, h) {
+  const crc = crc32(bytes);
+  if (kind === "image") {
+    const p = new Uint8Array(14);
+    const dv = new DataView(p.buffer);
+    p[0] = 0x10;
     dv.setUint16(1, w, true);
     dv.setUint16(3, h, true);
     dv.setUint32(5, bytes.length, true);
     dv.setUint32(9, crc, true);
-    start[13] = ACK_EVERY;
-    await ctrl.writeValueWithResponse(start);
-    let st = notifyOk ? await waitFor(s => s.state === 1, 2000) : null;
-    if (!st) st = await readStatus();
-    if (!st || st.state !== 1) throw new Error("デバイスが転送を開始しませんでした");
-    log(`転送開始: ${w}×${h} (${bytes.length} B)`);
+    p[13] = ACK_EVERY;
+    return p;
+  }
+  const p = new Uint8Array(10);
+  const dv = new DataView(p.buffer);
+  p[0] = 0x11;
+  dv.setUint32(1, bytes.length, true);
+  dv.setUint32(5, crc, true);
+  p[9] = ACK_EVERY;
+  return p;
+}
 
-    // --- data: windows of ACK_EVERY packets, each acknowledged -----------
-    let chunk = CHUNK_BIG;
-    let off = 0;
-    let rewinds = 0;
-    const t0 = performance.now();
-    while (off < bytes.length) {
-      const burstStart = off;
-      for (let i = 0; i < ACK_EVERY && off < bytes.length; i++) {
-        const part = bytes.subarray(off, Math.min(off + chunk, bytes.length));
-        const pkt = new Uint8Array(2 + part.length);
-        pkt[0] = off & 0xFF;
-        pkt[1] = (off >> 8) & 0xFF;
-        pkt.set(part, 2);
-        try {
-          await data.writeValueWithoutResponse(pkt);
-        } catch (e) {
-          if (chunk > CHUNK_SMALL) {
-            // The link's MTU is smaller than expected: use small packets.
-            chunk = CHUNK_SMALL;
-            log("小さいパケットに切り替えます。");
-            break;
-          }
-          throw e;
-        }
-        off += part.length;
-      }
-      const burstEnd = off;
-      st = notifyOk ? await waitFor(s => s.received >= burstEnd, 1500) : null;
-      if (!st || st.received < burstEnd) {
-        st = await syncStatus();
-        if (!st) throw new Error("デバイスから応答がありません");
-        if (st.state !== 1) throw new Error("デバイスが転送を中断しました (" + (STATE_NAMES[st.state] || st.state) + ")");
-        if (st.received < burstEnd) {
-          rewinds++;
-          if (st.received === burstStart && chunk > CHUNK_SMALL) {
-            chunk = CHUNK_SMALL;
-            log("小さいパケットに切り替えます。");
-          }
-          off = st.received;
-        }
-      }
-      bar.style.width = (off / bytes.length * 100).toFixed(1) + "%";
+/// Run `fn` with a connected session; handles buttons, errors, disconnect.
+async function withPlate(fn) {
+  for (const b of buttons) b.disabled = true;
+  bar.style.width = "0%";
+  let s = null;
+  try {
+    s = await connect();
+    await fn(s);
+    await sleep(300);
+  } catch (e) {
+    log("エラー: " + e.message, "err");
+  } finally {
+    if (s) s.close();
+    for (const b of buttons) b.disabled = false;
+    sendBtn.disabled = !packed;
+  }
+}
+
+// ------------------------------------------------------------ actions
+function fillFields(text) {
+  const lines = text.split("\n");
+  fields.name.value = lines[0] || "";
+  fields.title.value = lines[1] || "";
+  fields.org.value = lines[2] || "";
+  fields.note.value = lines[3] || "";
+  fields.url.value = lines[4] ? "https://" + lines[4] : "";
+}
+
+readBtn.addEventListener("click", () => withPlate(async s => {
+  const v = await s.content.readValue();
+  const text = new TextDecoder().decode(v);
+  fillFields(text);
+  log("読み込みました。", "ok");
+}));
+
+writeBtn.addEventListener("click", () => {
+  const enc = new TextEncoder();
+  const url = fields.url.value.trim().replace(/^https?:\/\//, "");
+  const four = [fields.name, fields.title, fields.org, fields.note].map(f => f.value.trim());
+  const textLen = four.reduce((n, t) => n + enc.encode(t).length, 0) + 3;
+  if (textLen > MAX_TEXT) {
+    log(`名前〜メモが長すぎます（${textLen} / ${MAX_TEXT} バイト）。`, "err");
+    return;
+  }
+  if (enc.encode(url).length > MAX_URL) {
+    log(`URL が長すぎます（最大 ${MAX_URL} バイト）。`, "err");
+    return;
+  }
+  const bytes = enc.encode([...four, url].join("\n"));
+  withPlate(async s => {
+    log(`公開内容を書き込み中 (${bytes.length} B)…`);
+    const st = await transfer(s, startPacket("content", bytes), bytes);
+    if (st && st.state === 2) {
+      log("公開内容を更新しました。数秒でプレートの表示が切り替わります。", "ok");
+    } else if (st) {
+      throw new Error("デバイスが内容を拒否しました (" + (STATE_NAMES[st.state] || st.state) + ")");
+    } else {
+      log("書き込み要求を送りました（確認は取れませんでした）。");
     }
-    const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    log(`送信完了 ${bytes.length} B (${dt} 秒${rewinds ? `, 再送 ${rewinds} 回` : ""})`);
+  });
+});
 
-    // --- commit: the device verifies the CRC and answers before refreshing
-    await ctrl.writeValueWithoutResponse(Uint8Array.of(0x02));
-    st = notifyOk ? await waitFor(s => s.state !== 1, 3000) : null;
-    if (!st) { await sleep(300); st = await readStatus(); }
+sendBtn.addEventListener("click", () => {
+  if (!packed) return;
+  const { w, h, bytes } = packed;
+  withPlate(async s => {
+    log(`転送開始: ${w}×${h} (${bytes.length} B)`);
+    const st = await transfer(s, startPacket("image", bytes, w, h), bytes);
     if (st && st.state === 2) {
       log("適用しました。数秒でプレートの表示が切り替わります。", "ok");
     } else if (st) {
@@ -400,13 +508,6 @@ async function send() {
     } else {
       log("適用要求を送りました（確認は取れませんでした）。表示を確認してください。");
     }
-    await sleep(300);
-  } catch (e) {
-    log("エラー: " + e.message, "err");
-  } finally {
-    try { if (gatt && gatt.connected) gatt.disconnect(); } catch (e) { /* ignore */ }
-    sendBtn.disabled = false;
-  }
-}
-sendBtn.addEventListener("click", send);
+  });
+});
 </script>

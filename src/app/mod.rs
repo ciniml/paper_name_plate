@@ -597,7 +597,23 @@ impl App {
         } else {
             info!("T2T: NDEF erased; keeping current content");
         }
-        // Normalise what we serve (canonical record layout) and persist it.
+        self.commit_content();
+    }
+
+    /// New plate text arrived over BLE (plain-text form): adopt, persist,
+    /// re-render, and serve it over NFC.
+    pub(crate) fn on_ble_content(&mut self, text: &[u8]) {
+        let text = alloc::string::String::from_utf8_lossy(text);
+        info!("BLE content: {} B", text.len());
+        match self.content.apply_plain(&text) {
+            Ok(()) => self.commit_content(),
+            Err(e) => warn!("BLE content rejected: {e}"),
+        }
+        self.last_activity = Instant::now();
+    }
+
+    /// The content changed: normalise the NDEF we serve, persist, redraw.
+    fn commit_content(&mut self) {
         let canonical = self.content.to_ndef();
         self.emu.set_ndef(&canonical);
         match crate::config_store::save(&mut self.board.flash, &canonical) {

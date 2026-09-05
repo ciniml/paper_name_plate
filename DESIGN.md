@@ -128,6 +128,7 @@ src/
 
 - **NFC 経由**（小画像 ≤ ~630B）: MIME レコード `image/x-plate`、`B64:<base64>` テキストも可。
 - **BLE 経由**（全画面まで、PC で ~12〜14 秒）: esp-radio + bleps の GATT サービス（`src/app/ble.rs`）。**プロトコル v2**: START(`10 w h len crc32 ack_every`) → DATA(`off:u16 | payload`、Write Command) を `ack_every` 個ずつ送り、STATUS 通知(`state received expected`)で ACK/NAK（順序違いは破棄して期待オフセットを通知、クライアントが巻き戻す）→ COMMIT で CRC32 検証・通知後に表示更新。GATT テーブルは手組みで DATA/CTRL に Write-Without-Response(0x04) を宣言（Android Chrome が高速書き込みを許可する条件）。bleps は `mtu128`（`Data` の 256B バッファを超えないため）。画像はフラッシュ永続化。送信ツール = Web Bluetooth アーティファクト / `tools/ble_send.py`。
+- **BLE から公開内容を設定**: CTRL `11 len crc32 ack_every` で始める同じウィンドウ転送で UTF-8 の `name\ntitle\norg\nnote\nurl` を送り、COMMIT で `PlateContent::apply_plain` → NDEF 正規化・保存・再描画。現在値は CONTENT characteristic（`...05`、読み出し、長い読み出し対応）。名前〜メモ合計 240 B、URL 200 B まで（NDEF 短レコードの制限）。Web ページに編集フォーム（読み込み／書き込み）。
 - BLE と NFC タグエミュレーションは 1 コアで競合するため、BLE 接続中は NFC 待受を止めて BLE を優先する（`tick_light`）。受信中は HCI ポンプ以外を止める。
 - **メモリ**: ヒープ ~155KB に BLE スタック + 受信画像 48KB + 表示中画像 48KB は入らないため、8KB を超える画像は描画・保存後にヒープから捨て、再描画時にフラッシュから読み直す（`draw_plate`/`trim_image`）。フラッシュ保存はヘッダとデータを 2 回に分けて書きコピーを作らない。
 - **省電力（CPU/無線）**: メインループの busy 待ちを esp-rtos のタスク sleep（idle hook = WFI、tick 1 kHz）に置換。NFC チップは IRQ ピン(GPIO6)が High のとき・リーダ交信中・250 ms 毎の安全ポーリング時のみ I2C アクセス、タッチは INT(GPIO4) が Low のときのみ読む、HCI は受信キューにデータがあるときだけポンプ。BLE 広告間隔 200〜250 ms。TF カード電源(TF_EN)は切る。heartbeat の `idle=NN%` が sleep 比率（待機時 ~98%）。
