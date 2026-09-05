@@ -105,6 +105,11 @@ pub fn load_image(flash: &mut FlashStorage<'_>) -> Option<Vec<u8>> {
     load_rec(flash, IMAGE_OFFSET, MAX_IMAGE, IMAGE_REGION)
 }
 
+/// Invalidate the stored display image (overwrites the record header).
+pub fn clear_image(flash: &mut FlashStorage<'_>) -> Result<(), esp_storage::FlashStorageError> {
+    flash.write(IMAGE_OFFSET, &[0xFF; HEADER])
+}
+
 /// Store the display image (`bits` = 1-bpp rows, MSB first) without
 /// copying it.
 pub fn save_image(

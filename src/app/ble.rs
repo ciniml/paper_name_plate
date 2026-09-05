@@ -11,6 +11,7 @@
 //!     0 → 8).
 //!   * `02` — commit: verify length + CRC and apply.
 //!   * `03` — abort.
+//!   * `06` — clear the display image (back to the text layout).
 //!   * `04` — sync: request a STATUS notification now.
 //! * DATA characteristic (write-without-response): `off:u16 | payload`.
 //!   Packets must arrive in order (`off` == bytes received so far); an
@@ -267,6 +268,8 @@ pub struct ImgRx {
     since_ack: u8,
     /// A NAK was already sent for the current out-of-order streak.
     nak_sent: bool,
+    /// CTRL `06`: drop the display image.
+    clear_image_req: bool,
     /// Bench: CTRL `05` requests a short doze test (light sleep a few
     /// times, then come back and report).
     doze_test_req: bool,
@@ -372,6 +375,10 @@ impl ImgRx {
             Some(0x05) => {
                 info!("BLE: doze test requested");
                 self.doze_test_req = true;
+            }
+            Some(0x06) => {
+                self.clear_image_req = true;
+                self.pending_ntf = true;
             }
             _ => warn!("BLE img: unknown ctrl {d:02X?}"),
         }
@@ -624,6 +631,17 @@ impl super::App {
                 *content_text.borrow_mut() = self.content.to_plain().into_bytes();
                 rx.borrow_mut().state = ST_IDLE;
                 errors = 0;
+            }
+            let clear = {
+                let mut r = rx.borrow_mut();
+                let c = r.clear_image_req && !r.pending_ntf;
+                if c {
+                    r.clear_image_req = false;
+                }
+                c
+            };
+            if clear {
+                self.on_clear_image();
             }
 
             // While a transfer is actively streaming, do NOTHING but pump HCI:

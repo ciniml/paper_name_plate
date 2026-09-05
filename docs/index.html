@@ -120,8 +120,9 @@
     <div class="row">
       <button id="read" class="secondary">プレートから読み込み</button>
       <button id="write">プレートに書き込み</button>
+      <button id="clearimg" class="secondary">表示画像を消す</button>
     </div>
-    <p class="hint">スマホをかざすと URL が開き、テキストレコードに名前・メール・GitHub・X・メモが入ります。GitHub と X はアカウント名のみ（@ 不要）。名前〜メモの 5 項目は合計 240 バイトまで（日本語は 1 文字 3 バイト）。</p>
+    <p class="hint">全画面画像を送ってあると画面は画像で覆われ、テキストは NFC でだけ配布されます。「表示画像を消す」でテキスト表示に戻ります。スマホをかざすと URL が開き、テキストレコードに名前・メール・GitHub・X・メモが入ります。GitHub と X はアカウント名のみ（@ 不要）。名前〜メモの 5 項目は合計 240 バイトまで（日本語は 1 文字 3 バイト）。</p>
   </section>
 
   <section>
@@ -171,10 +172,10 @@ const fields = { name: $("f-name"), email: $("f-email"), github: $("f-github"), 
 const fileEl = $("file"), sizeEl = $("size"), ditherEl = $("dither"), invertEl = $("invert"), threshEl = $("thresh");
 const canvas = $("preview");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
-const sendBtn = $("send"), readBtn = $("read"), writeBtn = $("write");
+const sendBtn = $("send"), readBtn = $("read"), writeBtn = $("write"), clearBtn = $("clearimg");
 const bar = $("bar");
 const logEl = $("log");
-const buttons = [sendBtn, readBtn, writeBtn];
+const buttons = [sendBtn, readBtn, writeBtn, clearBtn];
 
 let srcImage = null;
 let packed = null; // { w, h, bytes: Uint8Array }
@@ -497,6 +498,12 @@ writeBtn.addEventListener("click", () => {
     }
   });
 });
+
+clearBtn.addEventListener("click", () => withPlate(async s => {
+  await s.ctrl.writeValueWithResponse(Uint8Array.of(0x06));
+  await s.waitFor(() => true, 1500);
+  log("表示画像を消しました。数秒でテキスト表示に切り替わります。", "ok");
+}));
 
 sendBtn.addEventListener("click", () => {
   if (!packed) return;

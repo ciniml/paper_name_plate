@@ -612,6 +612,18 @@ impl App {
         self.last_activity = Instant::now();
     }
 
+    /// Drop the display image (BLE request): back to the text layout.
+    pub(crate) fn on_clear_image(&mut self) {
+        info!("BLE: clear image");
+        self.content.image = None;
+        self.image_in_flash = false;
+        if let Err(e) = crate::config_store::clear_image(&mut self.board.flash) {
+            error!("image clear failed: {e:?}");
+        }
+        self.commit_content();
+        self.last_activity = Instant::now();
+    }
+
     /// The content changed: normalise the NDEF we serve, persist, redraw.
     fn commit_content(&mut self) {
         let canonical = self.content.to_ndef();
