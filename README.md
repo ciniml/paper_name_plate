@@ -31,3 +31,10 @@ src/ssd1677/lut.rs      4-gray waveforms (from M5GFX, FreeBSD licence)
 src/ssd1677/framebuffer.rs  2-plane framebuffer + embedded-graphics DrawTarget
 src/bin/main.rs         application
 ```
+
+## Web Bluetooth sender page
+
+`docs/index.html` is a single-file page (Android Chrome) that sets the plate
+text and sends a dithered image over BLE. Web Bluetooth needs an HTTPS
+origin with the `bluetooth` permission, so it is served from GitHub Pages:
+<https://ciniml.github.io/paper_name_plate/>.
