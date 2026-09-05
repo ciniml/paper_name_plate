@@ -37,4 +37,4 @@ src/bin/main.rs         application
 `docs/index.html` is a single-file page (Android Chrome) that sets the plate
 text and sends a dithered image over BLE. Web Bluetooth needs an HTTPS
 origin with the `bluetooth` permission, so it is served from GitHub Pages:
-<https://ciniml.github.io/paper_name_plate/>.
+<https://www.fugafuga.org/paper_name_plate/> (GitHub Pages, user-site custom domain).
