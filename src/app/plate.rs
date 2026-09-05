@@ -277,6 +277,12 @@ impl PlateContent {
         t
     }
 
+    /// Check a plain-text form without applying it (see [`Self::apply_plain`]).
+    pub fn validate_plain(text: &str) -> Result<(), &'static str> {
+        let mut c = Self::default();
+        c.apply_plain(text)
+    }
+
     /// Update the text fields from the plain-text form (see [`Self::to_plain`]).
     /// Missing trailing lines clear the corresponding fields; the image is
     /// left untouched. Rejects (without changing anything) text that would

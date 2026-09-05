@@ -19,7 +19,7 @@
 //! * CONTENT characteristic (read): current plate text in the plain form.
 //! * STATUS characteristic (read / notify): `state:u8 received:u32 expected:u32`
 //!   state: 0 idle, 1 receiving, 2 committed, 3 CRC error, 4 commit with
-//!   missing data. A notification is sent after every `ack_every` accepted
+//!   missing data, 5 content rejected (too long / invalid). A notification is sent after every `ack_every` accepted
 //!   packets, when the last byte arrives, on NAK, and after start/commit/
 //!   abort/sync.
 //!
@@ -239,6 +239,7 @@ const ST_RECEIVING: u8 = 1;
 const ST_COMMITTED: u8 = 2;
 const ST_CRC_ERROR: u8 = 3;
 const ST_INCOMPLETE: u8 = 4;
+const ST_REJECTED: u8 = 5;
 
 const KIND_IMAGE: u8 = 1;
 const KIND_CONTENT: u8 = 2;
@@ -336,9 +337,19 @@ impl ImgRx {
                     self.state = ST_CRC_ERROR;
                     self.data = Vec::new();
                 } else if self.kind == KIND_CONTENT {
-                    info!("BLE content: commit ({} B, CRC ok)", self.data.len());
-                    self.state = ST_COMMITTED;
-                    self.done_content = Some(core::mem::take(&mut self.data));
+                    let text = alloc::string::String::from_utf8_lossy(&self.data);
+                    match super::plate::PlateContent::validate_plain(&text) {
+                        Ok(()) => {
+                            info!("BLE content: commit ({} B, CRC ok)", self.data.len());
+                            self.state = ST_COMMITTED;
+                            self.done_content = Some(core::mem::take(&mut self.data));
+                        }
+                        Err(e) => {
+                            warn!("BLE content: rejected ({e}): {:?}", text);
+                            self.state = ST_REJECTED;
+                            self.data = Vec::new();
+                        }
+                    }
                 } else {
                     info!("BLE img: commit ({} B, CRC ok)", self.data.len());
                     self.state = ST_COMMITTED;

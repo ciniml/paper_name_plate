@@ -278,7 +278,7 @@ function crc32(bytes) {
 }
 
 // ------------------------------------------------------------- BLE core
-const STATE_NAMES = { 0: "idle", 1: "receiving", 2: "committed", 3: "CRC error", 4: "incomplete" };
+const STATE_NAMES = { 0: "idle", 1: "receiving", 2: "committed", 3: "CRC error", 4: "incomplete", 5: "rejected: too long" };
 function parseStatus(v) {
   return { state: v.getUint8(0), received: v.getUint32(1, true), expected: v.getUint32(5, true) };
 }
