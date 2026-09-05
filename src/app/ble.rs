@@ -4,7 +4,7 @@
 //!
 //! * CTRL characteristic (write / write-without-response):
 //!   * `11 len:u32 crc32:u32 ack_every:u8` — start a plate-text transfer
-//!     (UTF-8 `name\ntitle\norg\nnote\nurl`, applied on commit).
+//!     (UTF-8 `name\nemail\ngithub\nx\nnote\nurl`, applied on commit).
 //!   * `10 w:u16 h:u16 len:u32 crc32:u32 ack_every:u8` — start a transfer
 //!     (`len` = row_bytes*h, `crc32` = IEEE CRC-32 of the payload,
 //!     `ack_every` = number of accepted DATA packets per acknowledgement,

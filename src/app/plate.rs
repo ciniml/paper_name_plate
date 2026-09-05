@@ -1,8 +1,8 @@
 //! The name plate itself: content model, NDEF mapping and rendering.
 //!
 //! Content convention (writable from a phone with any NFC tag writer):
-//! * a Text record ("T") holds up to four lines: name / title / organisation
-//!   / extra note (separated by `\n`)
+//! * a Text record ("T") holds up to five lines: name / e-mail / GitHub
+//!   account / X (Twitter) account / extra note (separated by `\n`)
 //! * a URI record ("U") holds the link that is also served to readers
 //!
 //! The same NDEF message is what the emulated tag serves, so whatever a
@@ -161,8 +161,11 @@ fn b64_decode(s: &[u8]) -> Option<Vec<u8>> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlateContent {
     pub name: String,
-    pub title: String,
-    pub org: String,
+    pub email: String,
+    /// GitHub account name (without `@`).
+    pub github: String,
+    /// X (Twitter) account name (without `@`).
+    pub x: String,
     pub note: String,
     pub url: String,
     pub image: Option<MonoImage>,
@@ -172,8 +175,9 @@ impl PlateContent {
     pub fn demo() -> Self {
         Self {
             name: String::from("Kenta IDA"),
-            title: String::from("Embedded Engineer"),
-            org: String::from("bare-metal Rust / esp-hal"),
+            email: String::from("kenta@example.com"),
+            github: String::from("ciniml"),
+            x: String::from("ciniml"),
             note: String::from("Tap your phone to get the link"),
             url: String::from("github.com/esp-rs/esp-hal"),
             image: None,
@@ -251,7 +255,7 @@ impl PlateContent {
 
     fn text_payload(&self) -> Vec<u8> {
         let mut t = Vec::new();
-        for (i, part) in [&self.name, &self.title, &self.org, &self.note].iter().enumerate() {
+        for (i, part) in [&self.name, &self.email, &self.github, &self.x, &self.note].iter().enumerate() {
             if i > 0 {
                 t.push(b'\n');
             }
@@ -261,10 +265,10 @@ impl PlateContent {
     }
 
     /// Plain-text form used by the BLE content characteristic:
-    /// `name\ntitle\norg\nnote\nurl` (UTF-8, LF separated).
+    /// `name\nemail\ngithub\nx\nnote\nurl` (UTF-8, LF separated).
     pub fn to_plain(&self) -> String {
         let mut t = String::new();
-        for (i, part) in [&self.name, &self.title, &self.org, &self.note, &self.url].iter().enumerate() {
+        for (i, part) in [&self.name, &self.email, &self.github, &self.x, &self.note, &self.url].iter().enumerate() {
             if i > 0 {
                 t.push('\n');
             }
@@ -280,19 +284,21 @@ impl PlateContent {
     pub fn apply_plain(&mut self, text: &str) -> Result<(), &'static str> {
         let mut lines = text.split('\n').map(|l| l.trim_end_matches('\r').trim());
         let name = lines.next().unwrap_or("");
-        let title = lines.next().unwrap_or("");
-        let org = lines.next().unwrap_or("");
+        let email = lines.next().unwrap_or("");
+        let github = lines.next().unwrap_or("").trim_start_matches('@');
+        let x = lines.next().unwrap_or("").trim_start_matches('@');
         let note = lines.next().unwrap_or("");
         let url = lines.next().unwrap_or("").trim_start_matches("https://").trim_start_matches("http://");
-        if name.len() + title.len() + org.len() + note.len() + 3 > MAX_TEXT_PAYLOAD {
+        if name.len() + email.len() + github.len() + x.len() + note.len() + 4 > MAX_TEXT_PAYLOAD {
             return Err("text too long");
         }
         if url.len() > MAX_URL_LEN {
             return Err("url too long");
         }
         self.name = name.into();
-        self.title = title.into();
-        self.org = org.into();
+        self.email = email.into();
+        self.github = github.into();
+        self.x = x.into();
         self.note = note.into();
         self.url = url.into();
         Ok(())
@@ -311,8 +317,9 @@ impl PlateContent {
                         let text = String::from_utf8_lossy(text).replace(';', "\n");
                         let mut lines = text.lines();
                         self.name = lines.next().unwrap_or("").into();
-                        self.title = lines.next().unwrap_or("").into();
-                        self.org = lines.next().unwrap_or("").into();
+                        self.email = lines.next().unwrap_or("").into();
+                        self.github = lines.next().unwrap_or("").trim_start_matches('@').into();
+                        self.x = lines.next().unwrap_or("").trim_start_matches('@').into();
                         self.note = lines.next().unwrap_or("").into();
                     }
                 }
@@ -467,14 +474,21 @@ pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
             &mut Scale2x { fb },
         );
     }
-    for (text, y) in [(&c.title, 330), (&c.org, 375)] {
+    // Contact lines: e-mail, GitHub, X.
+    let github = if c.github.is_empty() { String::new() } else { alloc::format!("github.com/{}", c.github) };
+    let x = if c.x.is_empty() { String::new() } else { alloc::format!("@{} (X)", c.x) };
+    let mut y = 318;
+    for text in [&c.email, &github, &x] {
         if text.is_empty() {
             continue;
         }
+        let ty = y;
+        y += 42;
+        let text = text;
         if is_plain_ascii(text) {
             let _ = mid.render_aligned(
                 text.as_str(),
-                Point::new(cx, y),
+                Point::new(cx, ty),
                 VerticalPosition::Baseline,
                 HorizontalAlignment::Center,
                 FontColor::Transparent(Gray2::new(1)),
@@ -483,7 +497,7 @@ pub fn draw(fb: &mut FrameBuffer, c: &PlateContent) {
         } else {
             let _ = jp.render_aligned(
                 text.as_str(),
-                Point::new(cx, y),
+                Point::new(cx, ty),
                 VerticalPosition::Baseline,
                 HorizontalAlignment::Center,
                 FontColor::Transparent(Gray2::new(1)),

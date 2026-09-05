@@ -112,15 +112,16 @@
   <section>
     <h2>1. 公開内容（NFC で配布・画面に表示）</h2>
     <label class="field">名前 <input type="text" id="f-name" maxlength="80" placeholder="山田 太郎"></label>
-    <label class="field">肩書 <input type="text" id="f-title" maxlength="80" placeholder="Embedded Engineer"></label>
-    <label class="field">所属 <input type="text" id="f-org" maxlength="80" placeholder="ACME Corp"></label>
+    <label class="field">メール <input type="text" id="f-email" maxlength="80" placeholder="taro@example.com"></label>
+    <label class="field">GitHub <input type="text" id="f-github" maxlength="40" placeholder="octocat"></label>
+    <label class="field">X <input type="text" id="f-x" maxlength="40" placeholder="jack"></label>
     <label class="field">メモ <input type="text" id="f-note" maxlength="80" placeholder="Tap your phone to get the link"></label>
     <label class="field">URL <input type="url" id="f-url" maxlength="200" placeholder="https://example.com/you"></label>
     <div class="row">
       <button id="read" class="secondary">プレートから読み込み</button>
       <button id="write">プレートに書き込み</button>
     </div>
-    <p class="hint">スマホをかざすと URL が開きます。名前など 4 項目は合計 240 バイトまで（日本語は 1 文字 3 バイト）。</p>
+    <p class="hint">スマホをかざすと URL が開き、テキストレコードに名前・メール・GitHub・X・メモが入ります。GitHub と X はアカウント名のみ（@ 不要）。名前〜メモの 5 項目は合計 240 バイトまで（日本語は 1 文字 3 バイト）。</p>
   </section>
 
   <section>
@@ -162,11 +163,11 @@ const CONTENT = "50415045-5250-4c41-5445-000000000005";
 const ACK_EVERY = 16;     // packets per acknowledgement window
 const CHUNK_BIG = 123;    // data bytes per packet at MTU 128 (125 - 2 header)
 const CHUNK_SMALL = 18;   // data bytes per packet at MTU 23  (20 - 2 header)
-const MAX_TEXT = 240;     // name+title+org+note (+3 separators) limit on the device
+const MAX_TEXT = 240;     // name+email+github+x+note (+4 separators) limit on the device
 const MAX_URL = 200;
 
 const $ = id => document.getElementById(id);
-const fields = { name: $("f-name"), title: $("f-title"), org: $("f-org"), note: $("f-note"), url: $("f-url") };
+const fields = { name: $("f-name"), email: $("f-email"), github: $("f-github"), x: $("f-x"), note: $("f-note"), url: $("f-url") };
 const fileEl = $("file"), sizeEl = $("size"), ditherEl = $("dither"), invertEl = $("invert"), threshEl = $("thresh");
 const canvas = $("preview");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -455,10 +456,11 @@ async function withPlate(fn) {
 function fillFields(text) {
   const lines = text.split("\n");
   fields.name.value = lines[0] || "";
-  fields.title.value = lines[1] || "";
-  fields.org.value = lines[2] || "";
-  fields.note.value = lines[3] || "";
-  fields.url.value = lines[4] ? "https://" + lines[4] : "";
+  fields.email.value = lines[1] || "";
+  fields.github.value = lines[2] || "";
+  fields.x.value = lines[3] || "";
+  fields.note.value = lines[4] || "";
+  fields.url.value = lines[5] ? "https://" + lines[5] : "";
 }
 
 readBtn.addEventListener("click", () => withPlate(async s => {
@@ -471,8 +473,9 @@ readBtn.addEventListener("click", () => withPlate(async s => {
 writeBtn.addEventListener("click", () => {
   const enc = new TextEncoder();
   const url = fields.url.value.trim().replace(/^https?:\/\//, "");
-  const four = [fields.name, fields.title, fields.org, fields.note].map(f => f.value.trim());
-  const textLen = four.reduce((n, t) => n + enc.encode(t).length, 0) + 3;
+  const four = [fields.name, fields.email, fields.github, fields.x, fields.note]
+    .map(f => f.value.trim().replace(/^@/, ""));
+  const textLen = four.reduce((n, t) => n + enc.encode(t).length, 0) + 4;
   if (textLen > MAX_TEXT) {
     log(`名前〜メモが長すぎます（${textLen} / ${MAX_TEXT} バイト）。`, "err");
     return;

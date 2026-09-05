@@ -2,7 +2,7 @@
 """Read or write the plate text over BLE (PC test harness).
 
     ble_content.py                      # read current text
-    ble_content.py "Name" "Title" "Org" "Note" "example.com/x"   # write
+    ble_content.py "Name" "mail@example.com" "github" "x_account" "Note" "example.com/x"   # write
 """
 import asyncio, os, struct, sys, time, zlib
 from bleak import BleakClient, BleakScanner
@@ -33,7 +33,7 @@ async def main():
         print("current:", cur.decode("utf-8", "replace").split("\n"))
         if len(sys.argv) < 2:
             return
-        text = "\n".join(sys.argv[1:6]).encode("utf-8")
+        text = "\n".join(sys.argv[1:7]).encode("utf-8")
         q = asyncio.Queue()
         await c.start_notify(STAT, lambda _h, d: q.put_nowait(struct.unpack("<BII", bytes(d[:9]))))
         ack_every = 8
