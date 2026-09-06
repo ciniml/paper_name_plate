@@ -101,6 +101,12 @@
   #log .ok { color: var(--ok); }
   #log .err { color: var(--err); }
   .hint { font-size: 12px; color: var(--muted); margin: 0; }
+  .intro { font-size: 14px; margin: 0; }
+  .intro a { color: var(--accent); }
+  .intro ol { margin: 6px 0 0; padding-left: 1.4em; }
+  .intro li { margin: 2px 0; }
+  footer { font-size: 12px; color: var(--muted); text-align: center; }
+  footer a { color: var(--accent); }
 </style>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;600&family=IBM+Plex+Mono&display=swap">
 
@@ -108,6 +114,25 @@
   <h1>PaperPlate Sender
     <small>BLE でネームプレートの公開内容と画像を設定</small>
   </h1>
+
+  <section>
+    <h2>これは何？</h2>
+    <p class="intro">
+      <a href="https://github.com/ciniml/paper_name_plate">paper_name_plate</a> は
+      M5Stack PaperMono（4.7 型電子ペーパー）を NFC 付きネームプレートにするファームウェアです
+      （bare-metal Rust / esp-hal）。スマホをかざすと NFC タグとして名前・連絡先・URL を渡し、
+      画面には同じ内容か任意のモノクロ画像を表示します。このページはその設定ツールで、
+      Bluetooth Low Energy（Web Bluetooth）でプレートに書き込みます。
+    </p>
+    <p class="intro">使い方</p>
+    <ol class="intro">
+      <li>Android の Chrome でこのページを開き、プレートの電源を入れる（数分放置するとスリープするので、その場合はタッチかボタンで起こす）</li>
+      <li>「1. 公開内容」で「プレートから読み込み」→ 内容を編集 →「プレートに書き込み」。デバイス選択ダイアログで <b>PaperPlate</b> を選ぶ</li>
+      <li>画像を表示したいときは「2. 画像」でファイルを選び、プレビューを確認して「画像を送信」（全画面 48 KB で 10〜20 秒）</li>
+      <li>画像を表示中はテキストは NFC でのみ配布される。テキスト表示に戻すには「表示画像を消す」</li>
+    </ol>
+    <p class="hint">iOS の Safari は Web Bluetooth 非対応です。内容は NFC 書き込みアプリ（NFC Tools など）からテキストレコードで書くこともできます（名前;メール;GitHub;X;メモ の順、区切りは改行か「;」）。</p>
+  </section>
 
   <section>
     <h2>1. 公開内容（NFC で配布・画面に表示）</h2>
@@ -150,6 +175,11 @@
     <div class="progress"><div id="bar"></div></div>
     <pre id="log">Android の Chrome で開いてください。ボタンを押すとデバイス選択が出ます。</pre>
   </section>
+
+  <footer>
+    ソースコード・ファームウェア: <a href="https://github.com/ciniml/paper_name_plate">github.com/ciniml/paper_name_plate</a>
+    ／ BLE プロトコルは <code>src/app/ble.rs</code> 参照
+  </footer>
 </main>
 
 <script>
