@@ -38,3 +38,18 @@ src/bin/main.rs         application
 text and sends a dithered image over BLE. Web Bluetooth needs an HTTPS
 origin with the `bluetooth` permission, so it is served from GitHub Pages:
 <https://www.fugafuga.org/paper_name_plate/> (GitHub Pages, user-site custom domain).
+
+## Flashing a release
+
+Each [release](https://github.com/ciniml/paper_name_plate/releases) ships
+`paper_name_plate-merged.bin` (bootloader + partition table + app, 16 MB
+flash layout) and the ELF. Flash the merged image at offset 0 with either:
+
+```sh
+espflash write-bin 0x0 paper_name_plate-merged.bin
+# or
+esptool.py --chip esp32s3 write_flash 0x0 paper_name_plate-merged.bin
+```
+
+Then set the plate text and image from
+<https://www.fugafuga.org/paper_name_plate/> (Android Chrome).
