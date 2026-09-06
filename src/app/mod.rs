@@ -246,16 +246,13 @@ impl App {
         // refresh and just rebuild the "displayed" baseline.
         plate::draw(self.fb, &self.content);
         self.trim_image();
-        let b = &mut self.board;
         if self.woke_from_deep_sleep {
             info!("EPD: woke from deep sleep, panel content kept");
-        } else {
-            match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
-                Ok(()) => info!("EPD initial refresh done"),
-                Err(e) => error!("EPD refresh failed: {e:?}"),
-            }
+        } else if self.epd_refresh(GrayMode::Quality) {
+            info!("EPD initial refresh done");
         }
         self.displayed.copy_from(self.fb);
+        let b = &mut self.board;
 
         // Serve the plate content over NFC.
         self.emu.set_ndef(&self.content.to_ndef());
@@ -458,10 +455,8 @@ impl App {
         self.wake_epd();
         plate::draw(self.fb, &self.content);
         self.trim_image();
-        let b = &mut self.board;
-        match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Quality) {
-            Ok(()) => self.displayed.copy_from(self.fb),
-            Err(e) => error!("EPD refresh failed: {e:?}"),
+        if self.epd_refresh(GrayMode::Quality) {
+            self.displayed.copy_from(self.fb);
         }
         self.fast_refreshes = 1;
         self.last_activity = Instant::now();
@@ -644,12 +639,31 @@ impl App {
         }
         self.wake_epd();
         self.draw_plate();
-        let b = &mut self.board;
-        match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Text) {
-            Ok(()) => self.displayed.copy_from(self.fb),
-            Err(e) => error!("EPD refresh failed: {e:?}"),
+        if self.epd_refresh(GrayMode::Text) {
+            self.displayed.copy_from(self.fb);
         }
         self.fast_refreshes = 1;
+    }
+
+    /// Full refresh of `fb` with recovery: on a failure (typically
+    /// `BusyTimeout` when the panel was never powered or is wedged) hard
+    /// reset + re-init the controller and try once more. Returns success.
+    fn epd_refresh(&mut self, mode: GrayMode) -> bool {
+        for attempt in 1..=2 {
+            let b = &mut self.board;
+            match b.epd.display_gray4(&mut b.delay, self.fb, mode) {
+                Ok(()) => return true,
+                Err(e) => {
+                    error!("EPD refresh failed (attempt {attempt}): {e:?}");
+                    let _ = board::epd_power_on(&mut b.ioe, &mut b.delay);
+                    if let Err(e) = b.epd.init(&mut b.delay) {
+                        error!("EPD re-init failed: {e:?}");
+                    }
+                    self.epd_sleeping = false;
+                }
+            }
+        }
+        false
     }
 
     fn manage_epd_sleep(&mut self) {
@@ -803,13 +817,12 @@ impl App {
     /// Refresh the tag panel: differential fastest update most of the time,
     /// with a periodic absolute Text refresh against ghosting.
     fn refresh_panel_region(&mut self) {
-        let b = &mut self.board;
         if self.fast_refreshes.is_multiple_of(FASTEST_PER_FULL) {
-            match b.epd.display_gray4(&mut b.delay, self.fb, GrayMode::Text) {
-                Ok(()) => self.displayed.copy_from(self.fb),
-                Err(e) => error!("EPD text refresh failed: {e:?}"),
+            if self.epd_refresh(GrayMode::Text) {
+                self.displayed.copy_from(self.fb);
             }
         } else {
+            let b = &mut self.board;
             let (x0, w, y0, h) = FrameBuffer::native_region(ui::PANEL_X, ui::PANEL_Y, ui::PANEL_W, ui::PANEL_H);
             let t0 = Instant::now();
             match b.epd.refresh_fastest(&mut b.delay, &self.fb.msb, &self.displayed.lsb, &self.displayed.msb, x0, w, y0, h) {

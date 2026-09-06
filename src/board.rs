@@ -169,11 +169,33 @@ impl Board {
             Ok(uid) => info!("IOE1 ok: uid=0x{uid:04X} rev={}", ioe.rev().unwrap_or(0)),
             Err(e) => error!("IOE1 init failed: {e:?}"),
         }
-        if let Err(e) = epd_power_on(&mut ioe, &mut delay) {
-            error!("EPD power-on via IOE1 failed: {e:?}");
+        // The I2C bus is occasionally flaky right after a power event (USB
+        // plug, wake-up): a single NACK here used to leave the panel
+        // unpowered for the whole run. Retry the IOE1 writes.
+        let mut ok = false;
+        for attempt in 1..=5 {
+            match epd_power_on(&mut ioe, &mut delay) {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!("EPD power-on via IOE1 failed (attempt {attempt}): {e:?}");
+                    delay.delay_ms(20);
+                }
+            }
         }
-        if let Err(e) = nfc_power(&mut ioe, true) {
-            error!("NFC power-on via IOE1 failed: {e:?}");
+        if !ok {
+            error!("EPD power-on via IOE1 failed; panel will not work");
+        }
+        for attempt in 1..=5 {
+            match nfc_power(&mut ioe, true) {
+                Ok(()) => break,
+                Err(e) => {
+                    warn!("NFC power-on via IOE1 failed (attempt {attempt}): {e:?}");
+                    delay.delay_ms(20);
+                }
+            }
         }
 
         // ---- SSD1677 over SPI2 ----
@@ -185,9 +207,18 @@ impl Board {
         let cs = Output::new(p.GPIO16, Level::High, OutputConfig::default());
         let busy = Input::new(p.GPIO18, InputConfig::default().with_pull(Pull::Up));
         let mut epd = Ssd1677::new(spi, dc, cs, busy);
-        match epd.init(&mut delay) {
-            Ok(()) => info!("EPD init ok"),
-            Err(e) => error!("EPD init failed: {e:?}"),
+        for attempt in 1..=3 {
+            match epd.init(&mut delay) {
+                Ok(()) => {
+                    info!("EPD init ok");
+                    break;
+                }
+                Err(e) => {
+                    error!("EPD init failed (attempt {attempt}): {e:?}");
+                    // Re-run the power/reset sequence before trying again.
+                    let _ = epd_power_on(&mut ioe, &mut delay);
+                }
+            }
         }
 
         // ---- Touch (needs its own reset: ~300 ms boot time) ----
